@@ -1,104 +1,209 @@
-# NeuS
-We present a novel neural surface reconstruction method, called NeuS (pronunciation: /nuːz/, same as "news"), for reconstructing objects and scenes with high fidelity from 2D image inputs.
+# ReNeuS: Neural Surface Reconstruction with Refraction-Aware Rendering
 
-![](./static/intro_1_compressed.gif)
-![](./static/intro_2_compressed.gif)
+基於 [NeuS](https://github.com/Totoro97/NeuS) 修改的 ReNeuS 實現，用於透明容器內物體的神經表面重建。
 
-## [Project page](https://lingjie0206.github.io/papers/NeuS/) |  [Paper](https://arxiv.org/abs/2106.10689) | [Data](https://www.dropbox.com/sh/w0y8bbdmxzik3uk/AAAaZffBiJevxQzRskoOYcyja?dl=0)
-This is the official repo for the implementation of **NeuS: Learning Neural Implicit Surfaces by Volume Rendering for Multi-view Reconstruction**.
+## 概述
 
-## Usage
+ReNeuS 是一種折射感知的神經隱式表面重建方法，專門設計用於處理透過透明介質（如玻璃容器、水箱）觀察物體的場景。與原始 NeuS 假設光線直線傳播不同，ReNeuS 考慮了光線在容器表面的折射，從而能夠準確重建容器內部的物體幾何。
 
-#### Data Convention
-The data is organized as follows:
+### 核心特性
 
-```
-<case_name>
-|-- cameras_xxx.npz    # camera parameters
-|-- image
-    |-- 000.png        # target image for each view
-    |-- 001.png
-    ...
-|-- mask
-    |-- 000.png        # target mask each view (For unmasked setting, set all pixels as 255)
-    |-- 001.png
-    ...
-```
+- **物理準確的折射計算**：使用 Snell's Law 和完整 Fresnel 方程
+- **全內反射 (TIR) 處理**：正確檢測和處理臨界角情況
+- **批量高效渲染**：使用 trimesh + pyembree 加速 ray-mesh intersection
+- **靈活配置**：自動從 `metadata.json` 讀取場景參數
+- **向後兼容**：沒有容器 mesh 時自動退回到原始 NeuS
 
-Here the `cameras_xxx.npz` follows the data format in [IDR](https://github.com/lioryariv/idr/blob/main/DATA_CONVENTION.md), where `world_mat_xx` denotes the world to image projection matrix, and `scale_mat_xx` denotes the normalization matrix.
+## 安裝
 
-### Setup
+### 依賴項
 
-Clone this repository
+```bash
+# 基礎依賴（與 NeuS 相同）
+pip install torch torchvision
+pip install opencv-python pyhocon icecream tqdm numpy
 
-```shell
-git clone https://github.com/Totoro97/NeuS.git
-cd NeuS
-pip install -r requirements.txt
+# ReNeuS 額外依賴
+pip install trimesh
+pip install pyembree  # 可選，用於加速 ray-mesh intersection
 ```
 
-<details>
-  <summary> Dependencies (click to expand) </summary>
+## 數據格式
 
-  - torch==1.8.0
-  - opencv_python==4.5.2.52
-  - trimesh==3.9.8 
-  - numpy==1.19.2
-  - pyhocon==0.3.57
-  - icecream==2.1.0
-  - tqdm==4.50.2
-  - scipy==1.7.0
-  - PyMCubes==0.1.2
-
-</details>
-
-### Running
-
-- **Training without masks**
-
-```shell
-python exp_runner.py --mode train --conf ./confs/womask.conf --case <case_name>
-```
-
-- **Training with masks**
-
-```shell
-python exp_runner.py --mode train --conf ./confs/wmask.conf --case <case_name>
-```
-
-- **Extract surface from trained model** 
-
-```shell
-python exp_runner.py --mode validate_mesh --conf <config_file> --case <case_name> --is_continue # use latest checkpoint
-```
-
-The corresponding mesh can be found in `exp/<case_name>/<exp_name>/meshes/<iter_steps>.ply`.
-
-- **View interpolation**
-
-```shell
-python exp_runner.py --mode interpolate_<img_idx_0>_<img_idx_1> --conf <config_file> --case <case_name> --is_continue # use latest checkpoint
-```
-
-The corresponding image set of view interpolation can be found in `exp/<case_name>/<exp_name>/render/`.
-
-### Train NeuS with your custom data
-
-More information can be found in [preprocess_custom_data](https://github.com/Totoro97/NeuS/tree/main/preprocess_custom_data).
-
-## Citation
-
-Cite as below if you find this repository is helpful to your project:
+ReNeuS 數據集應包含以下結構：
 
 ```
-@article{wang2021neus,
-  title={NeuS: Learning Neural Implicit Surfaces by Volume Rendering for Multi-view Reconstruction},
-  author={Wang, Peng and Liu, Lingjie and Liu, Yuan and Theobalt, Christian and Komura, Taku and Wang, Wenping},
-  journal={arXiv preprint arXiv:2106.10689},
-  year={2021}
+Dataset/ReNeuS/[case_name]/
+├── metadata.json          # ReNeuS 場景配置
+├── cameras_sphere.npz     # 相機參數
+├── image/                 # RGB 圖像
+│   ├── 000.png
+│   ├── 001.png
+│   └── ...
+├── mask/                  # 前景遮罩
+│   ├── 000.png
+│   ├── 001.png
+│   └── ...
+└── meshes/
+    ├── glass_box.ply      # 容器 mesh（必需）
+    └── object.ply         # Ground truth（可選，用於評估）
+```
+
+### metadata.json 格式
+
+```json
+{
+  "IOR": 1.5,
+  "mesh_object": "meshes/object.ply",
+  "mesh_glass": "meshes/glass_box.ply",
+  "n_images": 200,
+  "image_width": 800,
+  "image_height": 800,
+  "focal_x": 1111.111111111111,
+  "focal_y": 1111.111111111111,
+  "cx": 400.0,
+  "cy": 400.0
 }
 ```
 
-## Acknowledgement
+參數說明：
+- `IOR`: 容器的折射率（Index of Refraction）
+  - 玻璃：1.5
+  - 水：1.33
+- `mesh_glass`: 容器 mesh 的路徑（相對於數據集目錄）
+- `mesh_object`: Ground truth mesh（可選）
 
-Some code snippets are borrowed from [IDR](https://github.com/lioryariv/idr) and [NeRF-pytorch](https://github.com/yenchenlin/nerf-pytorch). Thanks for these great projects.
+## 使用方法
+
+### 訓練
+
+```bash
+python exp_runner.py \
+    --conf ./confs/reneus.conf \
+    --mode train \
+    --case lego_glass \
+    --gpu 0
+```
+
+### 提取 Mesh
+
+```bash
+python exp_runner.py \
+    --conf ./confs/reneus.conf \
+    --mode validate_mesh \
+    --case lego_glass \
+    --is_continue \
+    --mcube_threshold 0.0
+```
+
+### 測試核心功能
+
+```bash
+python test_reneus.py
+```
+
+這將測試：
+- Snell's Law 折射計算
+- Fresnel 方程
+- 全內反射檢測
+- Dataset 加載
+
+## 配置
+
+### reneus.conf
+
+```hocon
+general {
+    base_exp_dir = ./exp/CASE_NAME/reneus
+}
+
+dataset {
+    data_dir = ./Dataset/ReNeuS/CASE_NAME/
+}
+
+model {
+    reneus {
+        max_bounces = 3  # 最大光線彈跳次數（論文建議 K=3）
+        # ior = 1.5      # 可選：覆蓋 metadata.json 中的 IOR
+    }
+    
+    # 其他網絡配置與 NeuS 相同
+    sdf_network { ... }
+    variance_network { ... }
+    rendering_network { ... }
+    neus_renderer { ... }
+}
+```
+
+## 實現細節
+
+### 光線追蹤流程
+
+1. **容器表面相交檢測**：計算相機光線與容器 mesh 的交點
+2. **折射計算**：應用 Snell's Law 計算進入容器後的光線方向
+3. **SDF 採樣**：沿折射光線進行 NeuS 標準採樣和渲染
+4. **背景處理**：未擊中容器的光線渲染背景色
+
+### 物理計算
+
+- **Snell's Law**: `n₁sin(θ₁) = n₂sin(θ₂)`
+- **Fresnel 方程**: 完整 s/p 偏振平均（非 Schlick 近似）
+- **全內反射**: `sin(θc) = n₂/n₁`
+
+## 測試結果
+
+使用 `test_reneus.py` 的測試結果：
+
+| 測試項目 | 結果 |
+|---------|------|
+| Snell's Law (45° → IOR 1.5) | 28.13° ✓ |
+| Fresnel (法向入射) | 0.0400 ✓ |
+| TIR 臨界角 (玻璃→空氣) | 41.81° ✓ |
+| Dataset 加載 | IOR=1.5 ✓ |
+
+## 當前實現狀態
+
+✅ **已實現：**
+- 完整的光學計算工具（折射、反射、Fresnel、TIR）
+- 單次折射渲染（入射到容器）
+- Dataset metadata 自動讀取
+- 配置文件系統
+- 向後兼容原始 NeuS
+
+🔄 **簡化版本：**
+當前實現為單次折射版本，適合驗證基礎功能和快速原型開發。
+
+📋 **未來擴展（可選）：**
+- 完整迭代光線追蹤（K=3 彈跳）
+- 出射折射（光線離開容器）
+- Fresnel 加權的反射/折射混合
+- 多次內部反射
+
+## 文件結構
+
+```
+ReNeuS/
+├── models/
+│   ├── renderer.py       # 核心渲染器（包含折射邏輯）
+│   ├── dataset.py        # Dataset 類別（讀取 metadata）
+│   ├── fields.py         # SDF/顏色網絡
+│   └── ...
+├── confs/
+│   ├── reneus.conf       # ReNeuS 專用配置
+│   └── wmask.conf        # 原始 NeuS 配置
+├── exp_runner.py         # 訓練/評估主程序
+├── test_reneus.py        # 核心功能測試
+└── README.md             # 本文件
+```
+
+## 參考
+
+- **NeuS**: Learning Neural Implicit Surfaces by Volume Rendering for Multi-view Reconstruction  
+  [Paper](https://arxiv.org/abs/2106.10689) | [Code](https://github.com/Totoro97/NeuS)
+
+- **ReNeuS**: Refraction-Aware Neural Surface Reconstruction (CVPR 2023)  
+  [Paper](https://arxiv.org/abs/2303.10987)
+
+## 致謝
+
+本實現基於 [NeuS](https://github.com/Totoro97/NeuS) 代碼庫，感謝原作者的優秀工作。
