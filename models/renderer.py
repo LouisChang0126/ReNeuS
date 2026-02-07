@@ -547,101 +547,213 @@ class NeuSRenderer:
 
     def render_with_refraction(self, rays_o, rays_d, near, far, perturb_overwrite=-1, background_rgb=None, cos_anneal_ratio=0.0):
         """
-        ReNeuS rendering with refraction-aware ray tracing.
-        Simplified version: single refraction entry into container, then standard NeuS rendering.
+        ReNeuS Iterative Rendering with Max Bounces = K (default 3)
+        
+        Implements physically correct ray tracing with:
+        - Multiple bounces (Entry -> Volume Render Inside -> Exit -> Background)
+        - Total Internal Reflection (TIR) handling
+        - Dynamic near/far bounds based on container exit points
+        - Proper throughput accumulation
         """
-        batch_size = rays_o.shape[0]
         device = rays_o.device
+        batch_size = rays_o.shape[0]
+
+        # --- Initialization ---
+        # Current ray state
+        curr_rays_o = rays_o.clone()
+        curr_rays_d = rays_d.clone()
         
-        # Step 1: Compute intersection with container surface
-        hit_mask, hit_points, hit_normals, hit_distances = ray_mesh_intersection(
-            rays_o, rays_d, self.ray_tracer
-        )
+        # Accumulators
+        final_color = torch.zeros(batch_size, 3, device=device)
+        throughput = torch.ones(batch_size, 1, device=device)  # How much light gets through
+        active_mask = torch.ones(batch_size, dtype=torch.bool, device=device)  # Rays still processing
         
-        # Initialize output
-        color_fine = torch.zeros(batch_size, 3, device=device)
-        s_val = torch.zeros(batch_size, 1, device=device)
-        weight_sum = torch.zeros(batch_size, 1, device=device)
+        # Medium tracking: 1.0 = Air, self.ior = Container/Liquid
+        curr_ior = torch.ones(batch_size, 1, device=device)
         
-        # Step 2: Handle rays that miss the container
-        if background_rgb is not None:
-            color_fine[~hit_mask] = background_rgb
-        
-        if not hit_mask.any():
-            return {
-                'color_fine': color_fine,
-                's_val': s_val,
-                'weight_sum': weight_sum,
-                'gradient_error': torch.tensor(0.0, device=device),
-                'weights': torch.zeros(batch_size, self.n_samples, device=device),
-                'gradients': torch.zeros(batch_size, self.n_samples, 3, device=device)
-            }
-        
-        # Step 3: Compute refraction for hitting rays
-        hit_indices = torch.where(hit_mask)[0]
-        rays_d_refract, _ = compute_refraction(
-            rays_d[hit_indices], hit_normals[hit_indices], ior_in=1.0, ior_out=self.ior
-        )
-        
-        # Offset to avoid self-intersection
-        rays_o_refract = hit_points[hit_indices] + 1e-4 * rays_d_refract
-        
-        # Step 4: Render along refracted rays
-        batch_size_hit = hit_indices.shape[0]
-        sample_dist = 2.0 / self.n_samples
-        z_vals = torch.linspace(0.0, 1.0, self.n_samples, device=device)
-        z_vals = z_vals[None, :].expand(batch_size_hit, -1) * 2.0  # Simple far=2.0
-        
-        perturb = self.perturb if perturb_overwrite < 0 else perturb_overwrite
-        if perturb > 0:
-            t_rand = (torch.rand([batch_size_hit, 1], device=device) - 0.5)
-            z_vals = z_vals + t_rand * 2.0 / self.n_samples
-        
-        # Up-sample
-        if self.n_importance > 0:
-            with torch.no_grad():
-                pts = rays_o_refract[:, None, :] + rays_d_refract[:, None, :] * z_vals[..., :, None]
-                sdf = self.sdf_network.sdf(pts.reshape(-1, 3)).reshape(batch_size_hit, self.n_samples)
+        # Metrics to return (from the first valid volume rendering bounce)
+        ret_s_val = torch.zeros(batch_size, 1, device=device)
+        ret_weights_sum = torch.zeros(batch_size, 1, device=device)
+        ret_gradient_error = torch.tensor(0.0, device=device)
+        ret_gradients = torch.zeros(batch_size, self.n_samples, 3, device=device)
+        ret_weights = torch.zeros(batch_size, self.n_samples, device=device)
+        has_rendered_volume = False
+
+        # Iterative ray tracing loop
+        for bounce in range(self.max_bounces):
+            if not active_mask.any():
+                break
+
+            # ------------------------------------------------------------------
+            # Step 1: Intersect with Container Mesh
+            # ------------------------------------------------------------------
+            hit_mask, hit_points, hit_normals, hit_distances = ray_mesh_intersection(
+                curr_rays_o, curr_rays_d, self.ray_tracer
+            )
+            
+            # Only update intersections for currently active rays
+            hit_mask = hit_mask & active_mask
+            
+            # ------------------------------------------------------------------
+            # Step 2: Handle Misses (Rays escaping to infinity/background)
+            # ------------------------------------------------------------------
+            escaping_mask = active_mask & (~hit_mask)
+            if escaping_mask.any():
+                if background_rgb is not None:
+                    # Add background color weighted by remaining throughput
+                    final_color[escaping_mask] += throughput[escaping_mask] * background_rgb
                 
-                for i in range(self.up_sample_steps):
-                    new_z_vals = self.up_sample(
-                        rays_o_refract, rays_d_refract, z_vals, sdf,
-                        self.n_importance // self.up_sample_steps, 64 * 2**i
-                    )
-                    z_vals, sdf = self.cat_z_vals(
-                        rays_o_refract, rays_d_refract, z_vals, new_z_vals, sdf,
-                        last=(i + 1 == self.up_sample_steps)
-                    )
-        
-        # Render core
-        ret_fine = self.render_core(
-            rays_o_refract, rays_d_refract, z_vals, sample_dist,
-            self.sdf_network, self.deviation_network, self.color_network,
-            background_rgb=background_rgb, cos_anneal_ratio=cos_anneal_ratio
-        )
-        
-        # Fill results
-        color_fine[hit_indices] = ret_fine['color']
-        weight_sum[hit_indices] = ret_fine['weights'].sum(dim=-1, keepdim=True)
-        
-        n_samples_final = z_vals.shape[1]
-        s_val_mean = ret_fine['s_val'].reshape(batch_size_hit, n_samples_final).mean(dim=-1, keepdim=True)
-        s_val[hit_indices] = s_val_mean
-        
-        gradients_all = torch.zeros(batch_size, n_samples_final, 3, device=device)
-        gradients_all[hit_indices] = ret_fine['gradients']
-        
-        weights_all = torch.zeros(batch_size, n_samples_final, device=device)
-        weights_all[hit_indices] = ret_fine['weights']
+                # These rays are done
+                active_mask[escaping_mask] = False
+
+            if not active_mask.any():
+                break
+                
+            # ------------------------------------------------------------------
+            # Step 3: Volume Rendering Inside Container
+            # ------------------------------------------------------------------
+            # Check if we are currently INSIDE the container (curr_ior > 1.0)
+            # If inside, we must volume render before hitting the exit surface
+            is_inside_mask = (curr_ior > 1.0).squeeze() & hit_mask
+            
+            if is_inside_mask.any():
+                # We are inside liquid/glass, marching towards the exit point
+                # Calculate dynamic far bound (distance to exit)
+                dist_to_exit = hit_distances[is_inside_mask]
+                
+                # Setup rendering segment
+                batch_active = is_inside_mask.sum().item()
+                
+                # Create z_vals for this segment
+                z_vals = torch.linspace(0.0, 1.0, self.n_samples, device=device)
+                z_vals = z_vals[None, :].expand(batch_active, -1) * dist_to_exit[:, None]
+                
+                # Perturb
+                perturb = self.perturb if perturb_overwrite < 0 else perturb_overwrite
+                if perturb > 0:
+                    t_rand = (torch.rand([batch_active, 1], device=device) - 0.5)
+                    z_vals = z_vals + t_rand * (dist_to_exit[:, None] / self.n_samples)
+
+                # Get active rays
+                rays_o_active = curr_rays_o[is_inside_mask]
+                rays_d_active = curr_rays_d[is_inside_mask]
+                
+                # Up-sample (Standard NeuS importance sampling)
+                if self.n_importance > 0:
+                    with torch.no_grad():
+                        pts = rays_o_active[:, None, :] + rays_d_active[:, None, :] * z_vals[..., :, None]
+                        sdf = self.sdf_network.sdf(pts.reshape(-1, 3)).reshape(batch_active, self.n_samples)
+                        
+                        for i in range(self.up_sample_steps):
+                            new_z_vals = self.up_sample(
+                                rays_o_active, rays_d_active, z_vals, sdf,
+                                self.n_importance // self.up_sample_steps, 64 * 2**i
+                            )
+                            z_vals, sdf = self.cat_z_vals(
+                                rays_o_active, rays_d_active, z_vals, new_z_vals, sdf,
+                                last=(i + 1 == self.up_sample_steps)
+                            )
+                
+                # Render Core (Volume Rendering)
+                sample_dist = dist_to_exit.mean().item() / self.n_samples
+                
+                ret_fine = self.render_core(
+                    rays_o_active, rays_d_active, z_vals, sample_dist,
+                    self.sdf_network, self.deviation_network, self.color_network,
+                    background_rgb=None,  # Background added at end of bounces
+                    cos_anneal_ratio=cos_anneal_ratio
+                )
+                
+                # Accumulate volume color
+                vol_color = ret_fine['color']
+                vol_weights_sum = ret_fine['weights'].sum(dim=-1, keepdim=True)
+                
+                # Add to final color, attenuated by current throughput
+                final_color[is_inside_mask] += throughput[is_inside_mask] * vol_color
+                
+                # Update throughput (light that passed through the object)
+                # T_new = T_old * (1 - alpha)
+                throughput[is_inside_mask] *= (1.0 - vol_weights_sum).clamp(0.0, 1.0)
+                
+                # Store metrics (from first volume render for training)
+                if not has_rendered_volume:
+                    ret_gradient_error = ret_fine['gradient_error']
+                    ret_s_val[is_inside_mask] = ret_fine['s_val'].reshape(batch_active, -1).mean(dim=-1, keepdim=True)
+                    ret_weights_sum[is_inside_mask] = vol_weights_sum
+                    
+                    # Store gradients/weights (align dimensions)
+                    feat_n_samples = ret_fine['gradients'].shape[1]
+                    if feat_n_samples >= self.n_samples:
+                        ret_gradients[is_inside_mask] = ret_fine['gradients'][:, :self.n_samples, :]
+                        ret_weights[is_inside_mask] = ret_fine['weights'][:, :self.n_samples]
+                    
+                    has_rendered_volume = True
+                
+                # Early termination: If throughput is very low (opaque object), kill ray
+                low_throughput = (throughput[is_inside_mask] < 1e-3).squeeze()
+                if low_throughput.any():
+                    # Map back to full batch
+                    inside_indices = torch.where(is_inside_mask)[0]
+                    rays_to_kill = inside_indices[low_throughput]
+                    active_mask[rays_to_kill] = False
+
+            # ------------------------------------------------------------------
+            # Step 4: Compute Refraction/Reflection at Surface
+            # ------------------------------------------------------------------
+            # For all rays that hit the container surface
+            hit_indices = torch.where(hit_mask)[0]
+            
+            if len(hit_indices) == 0:
+                break
+            
+            # Prepare inputs
+            d_in = curr_rays_d[hit_indices]
+            n_surf = hit_normals[hit_indices]
+            
+            # Determine IORs (entering vs exiting)
+            ior1 = curr_ior[hit_indices]
+            ior2 = torch.where(
+                ior1 == 1.0,
+                torch.tensor(self.ior, device=device),
+                torch.tensor(1.0, device=device)
+            )
+            
+            # Compute Refraction
+            d_refract, valid_refract = compute_refraction(d_in, n_surf, ior1, ior2)
+            
+            # Handle Total Internal Reflection (TIR)
+            # If refraction is invalid, compute reflection
+            tir_mask = ~valid_refract
+            if tir_mask.any():
+                d_reflect = compute_reflection(d_in[tir_mask], n_surf[tir_mask])
+                d_refract[tir_mask] = d_reflect
+                # Note: IOR doesn't change for reflection (stays in same medium)
+            
+            # Update ray directions
+            next_d = d_refract
+            
+            # Update IOR (only for successfully refracted rays)
+            new_ior = ior1.clone()
+            new_ior[valid_refract] = ior2[valid_refract]
+            
+            # Update global state
+            curr_rays_d[hit_indices] = next_d
+            # Offset origin to avoid self-intersection
+            curr_rays_o[hit_indices] = hit_points[hit_indices] + 1e-4 * next_d
+            curr_ior[hit_indices] = new_ior
+
+        # ------------------------------------------------------------------
+        # End of Iterative Loop
+        # ------------------------------------------------------------------
         
         return {
-            'color_fine': color_fine,
-            's_val': s_val,
-            'weight_sum': weight_sum,
-            'weight_max': weight_sum,
-            'gradient_error': ret_fine['gradient_error'],
-            'gradients': gradients_all,
-            'weights': weights_all,
+            'color_fine': final_color,
+            's_val': ret_s_val,
+            'weight_sum': ret_weights_sum,
+            'weight_max': ret_weights_sum,
+            'gradient_error': ret_gradient_error,
+            'gradients': ret_gradients,
+            'weights': ret_weights,
         }
 
     def render(self, rays_o, rays_d, near, far, perturb_overwrite=-1, background_rgb=None, cos_anneal_ratio=0.0):
@@ -650,100 +762,102 @@ class NeuSRenderer:
             return self.render_with_refraction(
                 rays_o, rays_d, near, far, perturb_overwrite, background_rgb, cos_anneal_ratio
             )
+        else:
+            raise ValueError("Container mesh is not loaded")
         
-        # Original NeuS rendering (backward compatible)
-        batch_size = len(rays_o)
-        sample_dist = 2.0 / self.n_samples   # Assuming the region of interest is a unit sphere
-        z_vals = torch.linspace(0.0, 1.0, self.n_samples)
-        z_vals = near + (far - near) * z_vals[None, :]
+        # Original NeuS rendering (backward disabled)
+        # batch_size = len(rays_o)
+        # sample_dist = 2.0 / self.n_samples   # Assuming the region of interest is a unit sphere
+        # z_vals = torch.linspace(0.0, 1.0, self.n_samples)
+        # z_vals = near + (far - near) * z_vals[None, :]
 
-        z_vals_outside = None
-        if self.n_outside > 0:
-            z_vals_outside = torch.linspace(1e-3, 1.0 - 1.0 / (self.n_outside + 1.0), self.n_outside)
+        # z_vals_outside = None
+        # if self.n_outside > 0:
+        #     z_vals_outside = torch.linspace(1e-3, 1.0 - 1.0 / (self.n_outside + 1.0), self.n_outside)
 
-        n_samples = self.n_samples
-        perturb = self.perturb
+        # n_samples = self.n_samples
+        # perturb = self.perturb
 
-        if perturb_overwrite >= 0:
-            perturb = perturb_overwrite
-        if perturb > 0:
-            t_rand = (torch.rand([batch_size, 1]) - 0.5)
-            z_vals = z_vals + t_rand * 2.0 / self.n_samples
+        # if perturb_overwrite >= 0:
+        #     perturb = perturb_overwrite
+        # if perturb > 0:
+        #     t_rand = (torch.rand([batch_size, 1]) - 0.5)
+        #     z_vals = z_vals + t_rand * 2.0 / self.n_samples
 
-            if self.n_outside > 0:
-                mids = .5 * (z_vals_outside[..., 1:] + z_vals_outside[..., :-1])
-                upper = torch.cat([mids, z_vals_outside[..., -1:]], -1)
-                lower = torch.cat([z_vals_outside[..., :1], mids], -1)
-                t_rand = torch.rand([batch_size, z_vals_outside.shape[-1]])
-                z_vals_outside = lower[None, :] + (upper - lower)[None, :] * t_rand
+        #     if self.n_outside > 0:
+        #         mids = .5 * (z_vals_outside[..., 1:] + z_vals_outside[..., :-1])
+        #         upper = torch.cat([mids, z_vals_outside[..., -1:]], -1)
+        #         lower = torch.cat([z_vals_outside[..., :1], mids], -1)
+        #         t_rand = torch.rand([batch_size, z_vals_outside.shape[-1]])
+        #         z_vals_outside = lower[None, :] + (upper - lower)[None, :] * t_rand
 
-        if self.n_outside > 0:
-            z_vals_outside = far / torch.flip(z_vals_outside, dims=[-1]) + 1.0 / self.n_samples
+        # if self.n_outside > 0:
+        #     z_vals_outside = far / torch.flip(z_vals_outside, dims=[-1]) + 1.0 / self.n_samples
 
-        background_alpha = None
-        background_sampled_color = None
+        # background_alpha = None
+        # background_sampled_color = None
 
-        # Up sample
-        if self.n_importance > 0:
-            with torch.no_grad():
-                pts = rays_o[:, None, :] + rays_d[:, None, :] * z_vals[..., :, None]
-                sdf = self.sdf_network.sdf(pts.reshape(-1, 3)).reshape(batch_size, self.n_samples)
+        # # Up sample
+        # if self.n_importance > 0:
+        #     with torch.no_grad():
+        #         pts = rays_o[:, None, :] + rays_d[:, None, :] * z_vals[..., :, None]
+        #         sdf = self.sdf_network.sdf(pts.reshape(-1, 3)).reshape(batch_size, self.n_samples)
 
-                for i in range(self.up_sample_steps):
-                    new_z_vals = self.up_sample(rays_o,
-                                                rays_d,
-                                                z_vals,
-                                                sdf,
-                                                self.n_importance // self.up_sample_steps,
-                                                64 * 2**i)
-                    z_vals, sdf = self.cat_z_vals(rays_o,
-                                                  rays_d,
-                                                  z_vals,
-                                                  new_z_vals,
-                                                  sdf,
-                                                  last=(i + 1 == self.up_sample_steps))
+        #         for i in range(self.up_sample_steps):
+        #             new_z_vals = self.up_sample(rays_o,
+        #                                         rays_d,
+        #                                         z_vals,
+        #                                         sdf,
+        #                                         self.n_importance // self.up_sample_steps,
+        #                                         64 * 2**i)
+        #             z_vals, sdf = self.cat_z_vals(rays_o,
+        #                                           rays_d,
+        #                                           z_vals,
+        #                                           new_z_vals,
+        #                                           sdf,
+        #                                           last=(i + 1 == self.up_sample_steps))
 
-            n_samples = self.n_samples + self.n_importance
+        #     n_samples = self.n_samples + self.n_importance
 
-        # Background model
-        if self.n_outside > 0:
-            z_vals_feed = torch.cat([z_vals, z_vals_outside], dim=-1)
-            z_vals_feed, _ = torch.sort(z_vals_feed, dim=-1)
-            ret_outside = self.render_core_outside(rays_o, rays_d, z_vals_feed, sample_dist, self.nerf)
+        # # Background model
+        # if self.n_outside > 0:
+        #     z_vals_feed = torch.cat([z_vals, z_vals_outside], dim=-1)
+        #     z_vals_feed, _ = torch.sort(z_vals_feed, dim=-1)
+        #     ret_outside = self.render_core_outside(rays_o, rays_d, z_vals_feed, sample_dist, self.nerf)
 
-            background_sampled_color = ret_outside['sampled_color']
-            background_alpha = ret_outside['alpha']
+        #     background_sampled_color = ret_outside['sampled_color']
+        #     background_alpha = ret_outside['alpha']
 
-        # Render core
-        ret_fine = self.render_core(rays_o,
-                                    rays_d,
-                                    z_vals,
-                                    sample_dist,
-                                    self.sdf_network,
-                                    self.deviation_network,
-                                    self.color_network,
-                                    background_rgb=background_rgb,
-                                    background_alpha=background_alpha,
-                                    background_sampled_color=background_sampled_color,
-                                    cos_anneal_ratio=cos_anneal_ratio)
+        # # Render core
+        # ret_fine = self.render_core(rays_o,
+        #                             rays_d,
+        #                             z_vals,
+        #                             sample_dist,
+        #                             self.sdf_network,
+        #                             self.deviation_network,
+        #                             self.color_network,
+        #                             background_rgb=background_rgb,
+        #                             background_alpha=background_alpha,
+        #                             background_sampled_color=background_sampled_color,
+        #                             cos_anneal_ratio=cos_anneal_ratio)
 
-        color_fine = ret_fine['color']
-        weights = ret_fine['weights']
-        weights_sum = weights.sum(dim=-1, keepdim=True)
-        gradients = ret_fine['gradients']
-        s_val = ret_fine['s_val'].reshape(batch_size, n_samples).mean(dim=-1, keepdim=True)
+        # color_fine = ret_fine['color']
+        # weights = ret_fine['weights']
+        # weights_sum = weights.sum(dim=-1, keepdim=True)
+        # gradients = ret_fine['gradients']
+        # s_val = ret_fine['s_val'].reshape(batch_size, n_samples).mean(dim=-1, keepdim=True)
 
-        return {
-            'color_fine': color_fine,
-            's_val': s_val,
-            'cdf_fine': ret_fine['cdf'],
-            'weight_sum': weights_sum,
-            'weight_max': torch.max(weights, dim=-1, keepdim=True)[0],
-            'gradients': gradients,
-            'weights': weights,
-            'gradient_error': ret_fine['gradient_error'],
-            'inside_sphere': ret_fine['inside_sphere']
-        }
+        # return {
+        #     'color_fine': color_fine,
+        #     's_val': s_val,
+        #     'cdf_fine': ret_fine['cdf'],
+        #     'weight_sum': weights_sum,
+        #     'weight_max': torch.max(weights, dim=-1, keepdim=True)[0],
+        #     'gradients': gradients,
+        #     'weights': weights,
+        #     'gradient_error': ret_fine['gradient_error'],
+        #     'inside_sphere': ret_fine['inside_sphere']
+        # }
 
     def extract_geometry(self, bound_min, bound_max, resolution, threshold=0.0):
         return extract_geometry(bound_min,

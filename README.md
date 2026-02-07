@@ -201,8 +201,9 @@ ReNeuS/
 - **NeuS**: Learning Neural Implicit Surfaces by Volume Rendering for Multi-view Reconstruction  
   [Paper](https://arxiv.org/abs/2106.10689) | [Code](https://github.com/Totoro97/NeuS)
 
-- **ReNeuS**: Refraction-Aware Neural Surface Reconstruction (CVPR 2023)  
-  [Paper](https://arxiv.org/abs/2303.10987)
+- **ReNeuS**: Seeing Through the Glass: Neural 3D Reconstruction of Object Inside a
+Transparent Container (CVPR 2023)  
+  [Paper](https://arxiv.org/abs/2303.13805)
 
 ## 致謝
 
