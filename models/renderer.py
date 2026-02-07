@@ -7,6 +7,234 @@ import mcubes
 from icecream import ic
 
 
+# ==============================================================================
+# ReNeuS: Ray Tracing Utility Functions
+# ==============================================================================
+
+def compute_refraction(ray_d, normal, ior_in, ior_out):
+    """
+    Compute refraction direction using Snell's Law.
+    
+    Args:
+        ray_d: [N, 3] incident ray direction (normalized)
+        normal: [N, 3] surface normal (normalized, pointing outward)
+        ior_in: [N] or scalar, IOR of incident medium
+        ior_out: [N] or scalar, IOR of refracted medium
+    
+    Returns:
+        ray_d_refract: [N, 3] refracted ray direction (normalized)
+        valid_mask: [N] bool tensor, False if total internal reflection occurs
+    """
+    # Ensure inputs are normalized
+    ray_d = F.normalize(ray_d, dim=-1)
+    normal = F.normalize(normal, dim=-1)
+    
+    # Compute cos(theta_i)
+    cos_theta_i = -(ray_d * normal).sum(dim=-1, keepdim=True)
+    
+    # Handle rays hitting from inside (flip normal if needed)
+    # If cos_theta_i < 0, ray is hitting from inside, flip normal
+    normal = torch.where(cos_theta_i < 0, -normal, normal)
+    cos_theta_i = cos_theta_i.abs()
+    
+    # IOR ratio
+    if not isinstance(ior_in, torch.Tensor):
+        ior_in = torch.tensor(ior_in, device=ray_d.device)
+    if not isinstance(ior_out, torch.Tensor):
+        ior_out = torch.tensor(ior_out, device=ray_d.device)
+    
+    eta = ior_in / ior_out
+    if eta.dim() == 0:
+        eta = eta.unsqueeze(0).expand(ray_d.shape[0])
+    eta = eta.unsqueeze(-1)  # [N, 1]
+    
+    # Compute sin^2(theta_t) using Snell's law
+    sin2_theta_t = eta**2 * (1.0 - cos_theta_i**2)
+    
+    # Check for total internal reflection
+    valid_mask = (sin2_theta_t <= 1.0).squeeze(-1)
+    
+    # Compute refracted direction
+    cos_theta_t = torch.sqrt(torch.clamp(1.0 - sin2_theta_t, min=0.0))
+    ray_d_refract = eta * ray_d + (eta * cos_theta_i - cos_theta_t) * normal
+    ray_d_refract = F.normalize(ray_d_refract, dim=-1)
+    
+    return ray_d_refract, valid_mask
+
+
+def compute_reflection(ray_d, normal):
+    """
+    Compute reflection direction.
+    
+    Args:
+        ray_d: [N, 3] incident ray direction (normalized)
+        normal: [N, 3] surface normal (normalized, pointing outward)
+    
+    Returns:
+        ray_d_reflect: [N, 3] reflected ray direction (normalized)
+    """
+    ray_d = F.normalize(ray_d, dim=-1)
+    normal = F.normalize(normal, dim=-1)
+    
+    # R = D - 2(D·N)N
+    dot_dn = (ray_d * normal).sum(dim=-1, keepdim=True)
+    ray_d_reflect = ray_d - 2.0 * dot_dn * normal
+    
+    return F.normalize(ray_d_reflect, dim=-1)
+
+
+def compute_fresnel(cos_theta_i, ior_in, ior_out):
+    """
+    Compute Fresnel reflection coefficient using full Fresnel equations (unpolarized light).
+    
+    This provides more accurate physical gradients compared to Schlick approximation,
+    which is crucial for eliminating geometry ambiguity in ReNeuS.
+    
+    Args:
+        cos_theta_i: [N] cosine of incident angle (absolute value)
+        ior_in: [N] or scalar, IOR of incident medium
+        ior_out: [N] or scalar, IOR of transmitted medium
+    
+    Returns:
+        fresnel: [N] Fresnel reflection coefficient (0 to 1)
+    """
+    cos_theta_i = cos_theta_i.abs()
+    
+    if not isinstance(ior_in, torch.Tensor):
+        ior_in = torch.tensor(ior_in, device=cos_theta_i.device)
+    if not isinstance(ior_out, torch.Tensor):
+        ior_out = torch.tensor(ior_out, device=cos_theta_i.device)
+    
+    eta = ior_in / ior_out
+    if eta.dim() == 0:
+        eta = eta.expand(cos_theta_i.shape[0])
+    
+    # Compute sin^2(theta_t) using Snell's law
+    sin2_theta_t = eta**2 * (1.0 - cos_theta_i**2)
+    
+    # Total internal reflection
+    tir_mask = sin2_theta_t > 1.0
+    
+    cos_theta_t = torch.sqrt(torch.clamp(1.0 - sin2_theta_t, min=0.0))
+    
+    # Fresnel equations for s and p polarization
+    # Rs = |( n1*cos(theta_i) - n2*cos(theta_t) ) / ( n1*cos(theta_i) + n2*cos(theta_t) )|^2
+    # Rp = |( n2*cos(theta_i) - n1*cos(theta_t) ) / ( n2*cos(theta_i) + n1*cos(theta_t) )|^2
+    
+    rs_num = ior_in * cos_theta_i - ior_out * cos_theta_t
+    rs_den = ior_in * cos_theta_i + ior_out * cos_theta_t
+    rs = (rs_num / (rs_den + 1e-7))**2
+    
+    rp_num = ior_out * cos_theta_i - ior_in * cos_theta_t
+    rp_den = ior_out * cos_theta_i + ior_in * cos_theta_t
+    rp = (rp_num / (rp_den + 1e-7))**2
+    
+    # Unpolarized light: average of s and p polarization
+    fresnel = 0.5 * (rs + rp)
+    
+    # Total internal reflection: Fresnel = 1.0
+    fresnel = torch.where(tir_mask, torch.ones_like(fresnel), fresnel)
+    
+    return fresnel
+
+
+def check_total_internal_reflection(cos_theta_i, ior_in, ior_out):
+    """
+    Check if total internal reflection (TIR) occurs.
+    
+    Args:
+        cos_theta_i: [N] cosine of incident angle (absolute value)
+        ior_in: [N] or scalar, IOR of incident medium
+        ior_out: [N] or scalar, IOR of transmitted medium
+    
+    Returns:
+        tir_mask: [N] bool tensor, True if TIR occurs
+    """
+    cos_theta_i = cos_theta_i.abs()
+    
+    if not isinstance(ior_in, torch.Tensor):
+        ior_in = torch.tensor(ior_in, device=cos_theta_i.device)
+    if not isinstance(ior_out, torch.Tensor):
+        ior_out = torch.tensor(ior_out, device=cos_theta_i.device)
+    
+    eta = ior_in / ior_out
+    if eta.dim() == 0:
+        eta = eta.expand(cos_theta_i.shape[0])
+    
+    sin2_theta_t = eta**2 * (1.0 - cos_theta_i**2)
+    return sin2_theta_t > 1.0
+
+
+def ray_mesh_intersection(rays_o, rays_d, ray_tracer):
+    """
+    Batch compute ray-mesh intersections using trimesh ray tracer.
+    
+    Args:
+        rays_o: [N, 3] ray origins
+        rays_d: [N, 3] ray directions (should be normalized)
+        ray_tracer: trimesh.ray.ray_pyembree.RayMeshIntersector instance
+    
+    Returns:
+        hit_mask: [N] bool tensor, whether each ray hits the mesh
+        hit_points: [N, 3] intersection points (0 for missed rays)
+        hit_normals: [N, 3] surface normals at intersections (0 for missed rays)
+        hit_distances: [N] distances to intersections (inf for missed rays)
+    """
+    if ray_tracer is None:
+        # No container mesh, all rays miss
+        batch_size = rays_o.shape[0]
+        device = rays_o.device
+        return (
+            torch.zeros(batch_size, dtype=torch.bool, device=device),
+            torch.zeros(batch_size, 3, device=device),
+            torch.zeros(batch_size, 3, device=device),
+            torch.full((batch_size,), float('inf'), device=device)
+        )
+    
+    # Convert to numpy for trimesh
+    rays_o_np = rays_o.detach().cpu().numpy()
+    rays_d_np = rays_d.detach().cpu().numpy()
+    
+    # Perform ray casting
+    locations, index_ray, index_tri = ray_tracer.intersects_location(
+        rays_o_np, rays_d_np, multiple_hits=False
+    )
+    
+    device = rays_o.device
+    batch_size = rays_o.shape[0]
+    
+    # Initialize outputs
+    hit_mask = torch.zeros(batch_size, dtype=torch.bool, device=device)
+    hit_points = torch.zeros(batch_size, 3, device=device)
+    hit_normals = torch.zeros(batch_size, 3, device=device)
+    hit_distances = torch.full((batch_size,), float('inf'), device=device)
+    
+    if len(locations) > 0:
+        # Get surface normals
+        mesh = ray_tracer.mesh
+        face_normals = mesh.face_normals[index_tri]
+        
+        # Convert to torch tensors
+        locations_torch = torch.from_numpy(locations).float().to(device)
+        normals_torch = torch.from_numpy(face_normals).float().to(device)
+        index_ray_torch = torch.from_numpy(index_ray).long()
+        
+        # Compute distances
+        distances = torch.norm(locations_torch - rays_o[index_ray_torch], dim=-1)
+        
+        # Fill in results
+        hit_mask[index_ray_torch] = True
+        hit_points[index_ray_torch] = locations_torch
+        hit_normals[index_ray_torch] = normals_torch
+        hit_distances[index_ray_torch] = distances
+    
+    return hit_mask, hit_points, hit_normals, hit_distances
+
+
+# ==============================================================================
+# Original NeuS Functions
+# ==============================================================================
+
 def extract_fields(bound_min, bound_max, resolution, query_func):
     N = 64
     X = torch.linspace(bound_min[0], bound_max[0], resolution).split(N)
@@ -79,7 +307,10 @@ class NeuSRenderer:
                  n_importance,
                  n_outside,
                  up_sample_steps,
-                 perturb):
+                 perturb,
+                 container_mesh_path=None,
+                 ior=1.5,
+                 max_bounces=3):
         self.nerf = nerf
         self.sdf_network = sdf_network
         self.deviation_network = deviation_network
@@ -89,6 +320,37 @@ class NeuSRenderer:
         self.n_outside = n_outside
         self.up_sample_steps = up_sample_steps
         self.perturb = perturb
+        
+        # ReNeuS extensions
+        self.ior = ior
+        self.max_bounces = max_bounces
+        self.container_mesh = None
+        self.ray_tracer = None
+        
+        if container_mesh_path is not None:
+            try:
+                import trimesh
+                logging.info(f'[ReNeuS] Loading container mesh from: {container_mesh_path}')
+                self.container_mesh = trimesh.load(container_mesh_path, force='mesh')
+                
+                # Initialize ray tracer with Embree acceleration (requires pyembree)
+                try:
+                    self.ray_tracer = trimesh.ray.ray_pyembree.RayMeshIntersector(
+                        self.container_mesh
+                    )
+                    logging.info('[ReNeuS] Using Embree ray tracer (accelerated)')
+                except:
+                    logging.warning('[ReNeuS] Embree not available, using default ray tracer (slower)')
+                    self.ray_tracer = trimesh.ray.ray_triangle.RayMeshIntersector(
+                        self.container_mesh
+                    )
+                
+                logging.info(f'[ReNeuS] Container mesh loaded: {self.container_mesh.faces.shape[0]} faces, IOR={self.ior}')
+            except Exception as e:
+                logging.error(f'[ReNeuS] Failed to load container mesh: {e}')
+                self.container_mesh = None
+                self.ray_tracer = None
+
 
     def render_core_outside(self, rays_o, rays_d, z_vals, sample_dist, nerf, background_rgb=None):
         """
@@ -283,7 +545,113 @@ class NeuSRenderer:
             'inside_sphere': inside_sphere
         }
 
+    def render_with_refraction(self, rays_o, rays_d, near, far, perturb_overwrite=-1, background_rgb=None, cos_anneal_ratio=0.0):
+        """
+        ReNeuS rendering with refraction-aware ray tracing.
+        Simplified version: single refraction entry into container, then standard NeuS rendering.
+        """
+        batch_size = rays_o.shape[0]
+        device = rays_o.device
+        
+        # Step 1: Compute intersection with container surface
+        hit_mask, hit_points, hit_normals, hit_distances = ray_mesh_intersection(
+            rays_o, rays_d, self.ray_tracer
+        )
+        
+        # Initialize output
+        color_fine = torch.zeros(batch_size, 3, device=device)
+        s_val = torch.zeros(batch_size, 1, device=device)
+        weight_sum = torch.zeros(batch_size, 1, device=device)
+        
+        # Step 2: Handle rays that miss the container
+        if background_rgb is not None:
+            color_fine[~hit_mask] = background_rgb
+        
+        if not hit_mask.any():
+            return {
+                'color_fine': color_fine,
+                's_val': s_val,
+                'weight_sum': weight_sum,
+                'gradient_error': torch.tensor(0.0, device=device),
+                'weights': torch.zeros(batch_size, self.n_samples, device=device),
+                'gradients': torch.zeros(batch_size, self.n_samples, 3, device=device)
+            }
+        
+        # Step 3: Compute refraction for hitting rays
+        hit_indices = torch.where(hit_mask)[0]
+        rays_d_refract, _ = compute_refraction(
+            rays_d[hit_indices], hit_normals[hit_indices], ior_in=1.0, ior_out=self.ior
+        )
+        
+        # Offset to avoid self-intersection
+        rays_o_refract = hit_points[hit_indices] + 1e-4 * rays_d_refract
+        
+        # Step 4: Render along refracted rays
+        batch_size_hit = hit_indices.shape[0]
+        sample_dist = 2.0 / self.n_samples
+        z_vals = torch.linspace(0.0, 1.0, self.n_samples, device=device)
+        z_vals = z_vals[None, :].expand(batch_size_hit, -1) * 2.0  # Simple far=2.0
+        
+        perturb = self.perturb if perturb_overwrite < 0 else perturb_overwrite
+        if perturb > 0:
+            t_rand = (torch.rand([batch_size_hit, 1], device=device) - 0.5)
+            z_vals = z_vals + t_rand * 2.0 / self.n_samples
+        
+        # Up-sample
+        if self.n_importance > 0:
+            with torch.no_grad():
+                pts = rays_o_refract[:, None, :] + rays_d_refract[:, None, :] * z_vals[..., :, None]
+                sdf = self.sdf_network.sdf(pts.reshape(-1, 3)).reshape(batch_size_hit, self.n_samples)
+                
+                for i in range(self.up_sample_steps):
+                    new_z_vals = self.up_sample(
+                        rays_o_refract, rays_d_refract, z_vals, sdf,
+                        self.n_importance // self.up_sample_steps, 64 * 2**i
+                    )
+                    z_vals, sdf = self.cat_z_vals(
+                        rays_o_refract, rays_d_refract, z_vals, new_z_vals, sdf,
+                        last=(i + 1 == self.up_sample_steps)
+                    )
+        
+        # Render core
+        ret_fine = self.render_core(
+            rays_o_refract, rays_d_refract, z_vals, sample_dist,
+            self.sdf_network, self.deviation_network, self.color_network,
+            background_rgb=background_rgb, cos_anneal_ratio=cos_anneal_ratio
+        )
+        
+        # Fill results
+        color_fine[hit_indices] = ret_fine['color']
+        weight_sum[hit_indices] = ret_fine['weights'].sum(dim=-1, keepdim=True)
+        
+        n_samples_final = z_vals.shape[1]
+        s_val_mean = ret_fine['s_val'].reshape(batch_size_hit, n_samples_final).mean(dim=-1, keepdim=True)
+        s_val[hit_indices] = s_val_mean
+        
+        gradients_all = torch.zeros(batch_size, n_samples_final, 3, device=device)
+        gradients_all[hit_indices] = ret_fine['gradients']
+        
+        weights_all = torch.zeros(batch_size, n_samples_final, device=device)
+        weights_all[hit_indices] = ret_fine['weights']
+        
+        return {
+            'color_fine': color_fine,
+            's_val': s_val,
+            'weight_sum': weight_sum,
+            'weight_max': weight_sum,
+            'gradient_error': ret_fine['gradient_error'],
+            'gradients': gradients_all,
+            'weights': weights_all,
+        }
+
     def render(self, rays_o, rays_d, near, far, perturb_overwrite=-1, background_rgb=None, cos_anneal_ratio=0.0):
+        # ReNeuS: If container mesh is loaded, apply refraction-aware rendering
+        if self.container_mesh is not None:
+            return self.render_with_refraction(
+                rays_o, rays_d, near, far, perturb_overwrite, background_rgb, cos_anneal_ratio
+            )
+        
+        # Original NeuS rendering (backward compatible)
         batch_size = len(rays_o)
         sample_dist = 2.0 / self.n_samples   # Assuming the region of interest is a unit sphere
         z_vals = torch.linspace(0.0, 1.0, self.n_samples)

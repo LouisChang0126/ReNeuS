@@ -92,6 +92,29 @@ class Dataset:
         self.object_bbox_min = object_bbox_min[:3, 0]
         self.object_bbox_max = object_bbox_max[:3, 0]
 
+        # ReNeuS: Load metadata if available
+        self.ior = None
+        self.container_mesh_path = None
+        self.object_mesh_path = None
+        
+        metadata_path = os.path.join(self.data_dir, 'metadata.json')
+        if os.path.exists(metadata_path):
+            import json
+            with open(metadata_path, 'r') as f:
+                metadata = json.load(f)
+            
+            self.ior = metadata.get('IOR', None)
+            
+            # Container mesh path (relative to data_dir)
+            if 'mesh_glass' in metadata:
+                self.container_mesh_path = os.path.join(self.data_dir, metadata['mesh_glass'])
+            
+            # Object mesh path (for reference/validation)
+            if 'mesh_object' in metadata:
+                self.object_mesh_path = os.path.join(self.data_dir, metadata['mesh_object'])
+            
+            print(f'[ReNeuS] Loaded metadata: IOR={self.ior}, container_mesh={self.container_mesh_path}')
+        
         print('Load data: End')
 
     def gen_rays_at(self, img_idx, resolution_level=1):

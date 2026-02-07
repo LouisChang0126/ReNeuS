@@ -70,11 +70,24 @@ class Runner:
 
         self.optimizer = torch.optim.Adam(params_to_train, lr=self.learning_rate)
 
+        # ReNeuS: Get parameters from dataset metadata or config
+        container_mesh_path = getattr(self.dataset, 'container_mesh_path', None)
+        ior = getattr(self.dataset, 'ior', 1.5)
+        max_bounces = self.conf.get_int('model.reneus.max_bounces', default=3) if 'model.reneus' in self.conf else 3
+        
+        # Override IOR from config if specified
+        if 'model.reneus.ior' in self.conf:
+            ior = self.conf.get_float('model.reneus.ior')
+
         self.renderer = NeuSRenderer(self.nerf_outside,
                                      self.sdf_network,
                                      self.deviation_network,
                                      self.color_network,
-                                     **self.conf['model.neus_renderer'])
+                                     **self.conf['model.neus_renderer'],
+                                     container_mesh_path=container_mesh_path,
+                                     ior=ior,
+                                     max_bounces=max_bounces)
+
 
         # Load checkpoint
         latest_model_name = None
