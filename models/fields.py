@@ -6,6 +6,26 @@ from models.embedder import get_embedder
 
 
 # This implementation is borrowed from IDR: https://github.com/lioryariv/idr
+class SineLayer(nn.Module):
+    def __init__(self, in_features, out_features, bias=True, is_first=False, omega_0=30):
+        super().__init__()
+        self.omega_0 = omega_0
+        self.is_first = is_first
+        self.in_features = in_features
+        self.linear = nn.Linear(in_features, out_features, bias=bias)
+        self.init_weights()
+
+    def init_weights(self):
+        with torch.no_grad():
+            if self.is_first:
+                self.linear.weight.uniform_(-1 / self.in_features, 1 / self.in_features)
+            else:
+                self.linear.weight.uniform_(-np.sqrt(6 / self.in_features) / self.omega_0, 
+                                            np.sqrt(6 / self.in_features) / self.omega_0)
+
+    def forward(self, input):
+        return torch.sin(self.omega_0 * self.linear(input))
+
 class SDFNetwork(nn.Module):
     def __init__(self,
                  d_in,
@@ -21,6 +41,7 @@ class SDFNetwork(nn.Module):
                  inside_outside=False):
         super(SDFNetwork, self).__init__()
 
+        # SIREN implementation for ReNeuS
         dims = [d_in] + [d_hidden for _ in range(n_layers)] + [d_out]
 
         self.embed_fn_fine = None
@@ -40,34 +61,33 @@ class SDFNetwork(nn.Module):
             else:
                 out_dim = dims[l + 1]
 
-            lin = nn.Linear(dims[l], out_dim)
-
-            if geometric_init:
-                if l == self.num_layers - 2:
-                    if not inside_outside:
-                        torch.nn.init.normal_(lin.weight, mean=np.sqrt(np.pi) / np.sqrt(dims[l]), std=0.0001)
-                        torch.nn.init.constant_(lin.bias, -bias)
-                    else:
-                        torch.nn.init.normal_(lin.weight, mean=-np.sqrt(np.pi) / np.sqrt(dims[l]), std=0.0001)
-                        torch.nn.init.constant_(lin.bias, bias)
-                elif multires > 0 and l == 0:
-                    torch.nn.init.constant_(lin.bias, 0.0)
-                    torch.nn.init.constant_(lin.weight[:, 3:], 0.0)
-                    torch.nn.init.normal_(lin.weight[:, :3], 0.0, np.sqrt(2) / np.sqrt(out_dim))
-                elif multires > 0 and l in self.skip_in:
-                    torch.nn.init.constant_(lin.bias, 0.0)
-                    torch.nn.init.normal_(lin.weight, 0.0, np.sqrt(2) / np.sqrt(out_dim))
-                    torch.nn.init.constant_(lin.weight[:, -(dims[0] - 3):], 0.0)
+            # 只對非最後一層使用 SIREN 激活
+            if l < self.num_layers - 2:
+                # 隱藏層：使用 SineLayer
+                if l == 0:
+                    layer = SineLayer(dims[l], out_dim, is_first=True, omega_0=30.0)
                 else:
-                    torch.nn.init.constant_(lin.bias, 0.0)
-                    torch.nn.init.normal_(lin.weight, 0.0, np.sqrt(2) / np.sqrt(out_dim))
+                    layer = SineLayer(dims[l], out_dim, is_first=False, omega_0=30.0)
+                
+                if weight_norm:
+                    layer.linear = nn.utils.weight_norm(layer.linear)
+            else:
+                # 最後一層：普通 Linear，用於輸出 SDF
+                layer = nn.Linear(dims[l], out_dim)
+                
+                # 應用 geometric initialization (sphere bias)
+                if geometric_init:
+                    if not inside_outside:
+                        torch.nn.init.normal_(layer.weight, mean=np.sqrt(np.pi) / np.sqrt(dims[l]), std=0.0001)
+                        torch.nn.init.constant_(layer.bias, -bias)
+                    else:
+                        torch.nn.init.normal_(layer.weight, mean=-np.sqrt(np.pi) / np.sqrt(dims[l]), std=0.0001)
+                        torch.nn.init.constant_(layer.bias, bias)
+                
+                if weight_norm:
+                    layer = nn.utils.weight_norm(layer)
 
-            if weight_norm:
-                lin = nn.utils.weight_norm(lin)
-
-            setattr(self, "lin" + str(l), lin)
-
-        self.activation = nn.Softplus(beta=100)
+            setattr(self, "lin" + str(l), layer)
 
     def forward(self, inputs):
         inputs = inputs * self.scale
@@ -82,16 +102,10 @@ class SDFNetwork(nn.Module):
                 x = torch.cat([x, inputs], 1) / np.sqrt(2)
 
             x = lin(x)
-
-            if l < self.num_layers - 2:
-                x = self.activation(x)
         return torch.cat([x[:, :1] / self.scale, x[:, 1:]], dim=-1)
 
     def sdf(self, x):
         return self.forward(x)[:, :1]
-
-    def sdf_hidden_appearance(self, x):
-        return self.forward(x)
 
     def gradient(self, x):
         x.requires_grad_(True)
