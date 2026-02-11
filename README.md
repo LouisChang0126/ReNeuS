@@ -165,19 +165,29 @@ model {
 
 ✅ **已實現：**
 - 完整的光學計算工具（折射、反射、Fresnel、TIR）
-- 單次折射渲染（入射到容器）
+- K=3 次彈跳迭代光線追蹤
+- 出射折射（光線離開容器）
+- **Fresnel 加權的反射/折射採樣**（論文方法）
+  - 隨機採樣模式：根據 Fresnel 係數概率選擇反射或折射
+  - 可配置開關：`use_fresnel_weighted` 和 `fresnel_mode`
+- 統一的法線方向處理
 - Dataset metadata 自動讀取
 - 配置文件系統
 - 向後兼容原始 NeuS
 
-🔄 **簡化版本：**
-當前實現為單次折射版本，適合驗證基礎功能和快速原型開發。
+⚙️ **配置選項：**
+```hocon
+model.reneus {
+    max_bounces = 3                    # 光線彈跳次數
+    use_fresnel_weighted = True        # 啟用 Fresnel 加權（論文方法）
+    fresnel_mode = stochastic          # 'stochastic' 隨機採樣（論文）
+    # ior = 1.5                        # 可選：覆蓋 metadata.json
+}
+```
 
 📋 **未來擴展（可選）：**
-- 完整迭代光線追蹤（K=3 彈跳）
-- 出射折射（光線離開容器）
-- Fresnel 加權的反射/折射混合
-- 多次內部反射
+- 加權累積模式（`fresnel_mode = weighted_accumulation`）- 更穩定的訓練梯度
+- 背景區域的容器表面反射（邊緣情況優化）
 
 ## 文件結構
 

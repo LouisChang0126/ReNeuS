@@ -219,6 +219,12 @@ def ray_mesh_intersection(rays_o, rays_d, ray_tracer):
         normals_torch = torch.from_numpy(face_normals).float().to(device)
         index_ray_torch = torch.from_numpy(index_ray).long()
         
+        # Ensure normals point towards the incident ray (for consistent refraction calculation)
+        # If ray_d · normal > 0, normal and ray are in the same direction, flip normal
+        rays_d_hit = rays_d[index_ray_torch]
+        cos_theta = (rays_d_hit * normals_torch).sum(dim=-1, keepdim=True)
+        normals_torch = torch.where(cos_theta > 0, -normals_torch, normals_torch)
+        
         # Compute distances
         distances = torch.norm(locations_torch - rays_o[index_ray_torch], dim=-1)
         
@@ -310,7 +316,9 @@ class NeuSRenderer:
                  perturb,
                  container_mesh_path=None,
                  ior=1.5,
-                 max_bounces=3):
+                 max_bounces=3,
+                 use_fresnel_weighted=True,
+                 fresnel_mode='stochastic'):
         self.nerf = nerf
         self.sdf_network = sdf_network
         self.deviation_network = deviation_network
@@ -324,6 +332,8 @@ class NeuSRenderer:
         # ReNeuS extensions
         self.ior = ior
         self.max_bounces = max_bounces
+        self.use_fresnel_weighted = use_fresnel_weighted
+        self.fresnel_mode = fresnel_mode  # 'stochastic' or 'weighted_accumulation'
         self.container_mesh = None
         self.ray_tracer = None
         
@@ -722,19 +732,42 @@ class NeuSRenderer:
             d_refract, valid_refract = compute_refraction(d_in, n_surf, ior1, ior2)
             
             # Handle Total Internal Reflection (TIR)
-            # If refraction is invalid, compute reflection
+            # If refraction is invalid, use reflection
             tir_mask = ~valid_refract
-            if tir_mask.any():
-                d_reflect = compute_reflection(d_in[tir_mask], n_surf[tir_mask])
-                d_refract[tir_mask] = d_reflect
-                # Note: IOR doesn't change for reflection (stays in same medium)
+            d_reflect = compute_reflection(d_in, n_surf)
             
-            # Update ray directions
-            next_d = d_refract
-            
-            # Update IOR (only for successfully refracted rays)
-            new_ior = ior1.clone()
-            new_ior[valid_refract] = ior2[valid_refract]
+            # Apply Fresnel weighting if enabled
+            if self.use_fresnel_weighted and self.fresnel_mode == 'stochastic':
+                # Method 1: Stochastic sampling (paper's original method)
+                # Compute Fresnel coefficient
+                cos_theta_i = torch.abs((d_in * n_surf).sum(dim=-1))
+                fresnel_coef = compute_fresnel(cos_theta_i, ior1.squeeze(), ior2.squeeze())
+                
+                # For TIR cases, Fresnel coefficient is 1.0 (full reflection)
+                # Already handled in compute_fresnel, but enforce here for clarity
+                fresnel_coef = torch.where(tir_mask, torch.ones_like(fresnel_coef), fresnel_coef)
+                
+                # Randomly sample reflection vs refraction based on Fresnel coefficient
+                # rand < fresnel_coef => use reflection, otherwise use refraction
+                rand_samples = torch.rand(len(hit_indices), device=device)
+                use_reflection = rand_samples < fresnel_coef
+                
+                # Select direction: reflection or refraction
+                next_d = torch.where(use_reflection[:, None], d_reflect, d_refract)
+                
+                # Update IOR (only for refracted rays that are not TIR)
+                new_ior = ior1.clone()
+                # Only change IOR for rays that refract (not reflect and not TIR)
+                refract_mask = ~use_reflection & valid_refract
+                new_ior[refract_mask] = ior2[refract_mask]
+                
+            else:
+                # Original behavior: use refraction, fallback to reflection only for TIR
+                next_d = torch.where(tir_mask[:, None], d_reflect, d_refract)
+                
+                # Update IOR (only for successfully refracted rays)
+                new_ior = ior1.clone()
+                new_ior[valid_refract] = ior2[valid_refract]
             
             # Update global state
             curr_rays_d[hit_indices] = next_d
@@ -749,6 +782,7 @@ class NeuSRenderer:
         return {
             'color_fine': final_color,
             's_val': ret_s_val,
+            'cdf_fine': torch.zeros(batch_size, self.n_samples, device=device),  # Placeholder for compatibility
             'weight_sum': ret_weights_sum,
             'weight_max': ret_weights_sum,
             'gradient_error': ret_gradient_error,

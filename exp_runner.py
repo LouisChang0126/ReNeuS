@@ -74,6 +74,8 @@ class Runner:
         container_mesh_path = getattr(self.dataset, 'container_mesh_path', None)
         ior = getattr(self.dataset, 'ior', 1.5)
         max_bounces = self.conf.get_int('model.reneus.max_bounces', default=3) if 'model.reneus' in self.conf else 3
+        use_fresnel_weighted = self.conf.get_bool('model.reneus.use_fresnel_weighted', default=True) if 'model.reneus' in self.conf else True
+        fresnel_mode = self.conf.get_string('model.reneus.fresnel_mode', default='stochastic') if 'model.reneus' in self.conf else 'stochastic'
         
         # Override IOR from config if specified
         if 'model.reneus.ior' in self.conf:
@@ -86,7 +88,9 @@ class Runner:
                                      **self.conf['model.neus_renderer'],
                                      container_mesh_path=container_mesh_path,
                                      ior=ior,
-                                     max_bounces=max_bounces)
+                                     max_bounces=max_bounces,
+                                     use_fresnel_weighted=use_fresnel_weighted,
+                                     fresnel_mode=fresnel_mode)
 
 
         # Load checkpoint
