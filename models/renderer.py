@@ -574,6 +574,7 @@ class NeuSRenderer:
         curr_rays_d = rays_d.clone()
         
         # Accumulators
+        # Note: final_color starts as zeros but will accumulate gradients from render_core outputs
         final_color = torch.zeros(batch_size, 3, device=device)
         throughput = torch.ones(batch_size, 1, device=device)  # How much light gets through
         active_mask = torch.ones(batch_size, dtype=torch.bool, device=device)  # Rays still processing
@@ -679,11 +680,13 @@ class NeuSRenderer:
                 vol_weights_sum = ret_fine['weights'].sum(dim=-1, keepdim=True)
                 
                 # Add to final color, attenuated by current throughput
-                final_color[is_inside_mask] += throughput[is_inside_mask] * vol_color
+                # Gradient flows through vol_color even if throughput is detached
+                contribution = throughput[is_inside_mask] * vol_color
+                final_color[is_inside_mask] = final_color[is_inside_mask] + contribution
                 
                 # Update throughput (light that passed through the object)
                 # T_new = T_old * (1 - alpha)
-                throughput[is_inside_mask] *= (1.0 - vol_weights_sum).clamp(0.0, 1.0)
+                throughput[is_inside_mask] = throughput[is_inside_mask] * (1.0 - vol_weights_sum).clamp(0.0, 1.0)
                 
                 # Store metrics (from first volume render for training)
                 if not has_rendered_volume:
@@ -748,9 +751,10 @@ class NeuSRenderer:
                 fresnel_coef = torch.where(tir_mask, torch.ones_like(fresnel_coef), fresnel_coef)
                 
                 # Randomly sample reflection vs refraction based on Fresnel coefficient
-                # rand < fresnel_coef => use reflection, otherwise use refraction
+                # Use detach() to prevent gradient flow through the random sampling
+                # This makes the sampling non-differentiable (as it should be for stochastic mode)
                 rand_samples = torch.rand(len(hit_indices), device=device)
-                use_reflection = rand_samples < fresnel_coef
+                use_reflection = rand_samples < fresnel_coef.detach()
                 
                 # Select direction: reflection or refraction
                 next_d = torch.where(use_reflection[:, None], d_reflect, d_refract)
@@ -778,6 +782,20 @@ class NeuSRenderer:
         # ------------------------------------------------------------------
         # End of Iterative Loop
         # ------------------------------------------------------------------
+        
+        # Ensure gradient flow even if no rays entered the container
+        # This can happen at early training stages or with bad initialization
+        if not has_rendered_volume:
+            # Create a dummy gradient connection to prevent "no grad_fn" error
+            # This will produce black output but maintain gradient flow
+            dummy_sdf = self.sdf_network.sdf(rays_o[:1])  # Query SDF for one point
+            final_color = final_color + dummy_sdf.sum() * 0.0  # Add zero but keep gradient
+            ret_gradient_error = torch.tensor(0.01, device=device, requires_grad=True)  # Small penalty
+        
+        # Gamma Correction (Eq.12): I = C^(1/2.2)
+        # 論文假設 appearance MLP 輸出 linear space，需要 gamma correction
+        final_color = torch.clamp(final_color, 0.0, 1.0)
+        final_color = torch.pow(final_color + 1e-8, 1.0 / 2.2)
         
         return {
             'color_fine': final_color,

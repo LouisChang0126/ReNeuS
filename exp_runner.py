@@ -52,6 +52,7 @@ class Runner:
         # Weights
         self.igr_weight = self.conf.get_float('train.igr_weight')
         self.mask_weight = self.conf.get_float('train.mask_weight')
+        self.trans_weight = self.conf.get_float('train.trans_weight', default=0.1)  # ReNeuS Eq.13
         self.is_continue = is_continue
         self.mode = mode
         self.model_list = []
@@ -63,7 +64,8 @@ class Runner:
         self.sdf_network = SDFNetwork(**self.conf['model.sdf_network']).to(self.device)
         self.deviation_network = SingleVarianceNetwork(**self.conf['model.variance_network']).to(self.device)
         self.color_network = RenderingNetwork(**self.conf['model.rendering_network']).to(self.device)
-        params_to_train += list(self.nerf_outside.parameters())
+        # ReNeuS: Do NOT train nerf_outside (論文使用固定背景，非 NeRF++)
+        # params_to_train += list(self.nerf_outside.parameters())
         params_to_train += list(self.sdf_network.parameters())
         params_to_train += list(self.deviation_network.parameters())
         params_to_train += list(self.color_network.parameters())
@@ -126,7 +128,8 @@ class Runner:
 
             background_rgb = None
             if self.use_white_bkgd:
-                background_rgb = torch.ones([1, 3])
+                # ReNeuS 論文：固定背景色 [0.8, 0.8, 0.8] (before gamma correction)
+                background_rgb = torch.tensor([[0.8, 0.8, 0.8]])
 
             if self.mask_weight > 0.0:
                 mask = (mask > 0.5).float()
@@ -153,10 +156,15 @@ class Runner:
             eikonal_loss = gradient_error
 
             mask_loss = F.binary_cross_entropy(weight_sum.clip(1e-3, 1.0 - 1e-3), mask)
+            
+            # ReNeuS Transmittance Loss (Eq.15): Sparsity prior
+            # 強制容器內部（除物體外）透明
+            trans_loss = weight_sum.mean()
 
             loss = color_fine_loss +\
                    eikonal_loss * self.igr_weight +\
-                   mask_loss * self.mask_weight
+                   mask_loss * self.mask_weight +\
+                   trans_loss * self.trans_weight
 
             self.optimizer.zero_grad()
             loss.backward()
@@ -167,6 +175,7 @@ class Runner:
             self.writer.add_scalar('Loss/loss', loss, self.iter_step)
             self.writer.add_scalar('Loss/color_loss', color_fine_loss, self.iter_step)
             self.writer.add_scalar('Loss/eikonal_loss', eikonal_loss, self.iter_step)
+            self.writer.add_scalar('Loss/trans_loss', trans_loss, self.iter_step)
             self.writer.add_scalar('Statistics/s_val', s_val.mean(), self.iter_step)
             self.writer.add_scalar('Statistics/cdf', (cdf_fine[:, :1] * mask).sum() / mask_sum, self.iter_step)
             self.writer.add_scalar('Statistics/weight_max', (weight_max * mask).sum() / mask_sum, self.iter_step)
@@ -265,7 +274,7 @@ class Runner:
 
         for rays_o_batch, rays_d_batch in zip(rays_o, rays_d):
             near, far = self.dataset.near_far_from_sphere(rays_o_batch, rays_d_batch)
-            background_rgb = torch.ones([1, 3]) if self.use_white_bkgd else None
+            background_rgb = torch.tensor([[0.8, 0.8, 0.8]]) if self.use_white_bkgd else None
 
             render_out = self.renderer.render(rays_o_batch,
                                               rays_d_batch,
