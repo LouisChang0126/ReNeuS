@@ -139,10 +139,9 @@ class Runner:
                 # ReNeuS: 論文 Sec 4.3 明確 C_out = [0.8, 0.8, 0.8] (before gamma correction)
                 background_rgb = torch.tensor([[0.8, 0.8, 0.8]])
 
-            if self.mask_weight > 0.0:
-                mask = (mask > 0.5).float()
-            else:
-                mask = torch.ones_like(mask)
+            # [ReNeuS Eq.14] 永遠使用真實 mask M_in（容器投影區域）
+            # 論文: L_color = (1/|M_in|) Σ_{p∈M_in} ||C(p) - Ĉ(p)||
+            mask = (mask > 0.5).float()
 
             mask_sum = mask.sum() + 1e-5
             render_out = self.renderer.render(rays_o, rays_d, near, far,
@@ -163,7 +162,10 @@ class Runner:
 
             eikonal_loss = gradient_error
 
-            mask_loss = F.binary_cross_entropy(weight_sum.clip(1e-3, 1.0 - 1e-3), mask)
+            # [ReNeuS] 與 NeuS 原版差異：
+            # NeuS: 有mask_loss
+            # ReNeuS: 論文 Sec 4.3 明確移除 mask loss
+            # mask_loss = F.binary_cross_entropy(weight_sum.clip(1e-3, 1.0 - 1e-3), mask)
             
             # [ReNeuS Eq.15] Transmittance Loss: Sparsity prior
             # 使用所有 sub-ray 累積的 trans_loss，而非僅第一次 bounce
@@ -171,7 +173,6 @@ class Runner:
 
             loss = color_fine_loss +\
                    eikonal_loss * self.igr_weight +\
-                   mask_loss * self.mask_weight +\
                    trans_loss * self.trans_weight
 
             self.optimizer.zero_grad()

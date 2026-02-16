@@ -567,11 +567,24 @@ class NeuSRenderer:
 
     def render_with_refraction(self, rays_o, rays_d, near, far, perturb_overwrite=-1, background_rgb=None, cos_anneal_ratio=0.0):
         """
-        [ReNeuS] 迭代折射渲染 (論文 Sec 3.3, Eq.7-12)
+        [ReNeuS] Deterministic Branching 渲染 (論文 Sec 3.3, Eq.7-12)
+        
         NeuS 原版的 render() 方法僅做單次體渲染。
-        ReNeuS 新增本方法以實現：
-        - 多次彈跳光線追蹤 (Entry -> Volume Render -> Exit -> Background)
-        - Fresnel 加權的反射/折射採樣 (Eq.8-9)
+        ReNeuS 新增本方法以實現論文的 "hybrid rendering strategy"：
+        
+        核心差異（vs stochastic sampling）：
+        - 論文 Eq.8: C(ℓ) = R · C(ℓ_r) + T_re · C(ℓ_t)
+          在每個界面**同時計算**反射+折射兩條路徑，並以 Fresnel 係數加權累積。
+        - 論文 Eq.10: C(ℓ_i) = ACC_{m_i ∈ L_i}(C(m_i))
+          累積**所有** sub-ray 的顏色貢獻。
+        
+        實現方式：
+        - 使用 pixel_idx 追蹤多條 sub-ray 對應到同一原始像素
+        - 每個界面產生反射+折射兩組 ray（權重分別為 R 和 1-R）
+        - 使用 scatter_add_ 將所有 sub-ray 的顏色累積回原始像素
+        - Dre=2 時每像素最多 4 條 sub-ray
+        
+        其他功能：
         - 全內反射 (TIR) 處理
         - Throughput 累積 (Eq.11: T = exp(-∫ρds))
         - Gamma Correction (Eq.12: I = C^(1/2.2))
@@ -580,21 +593,8 @@ class NeuSRenderer:
         device = rays_o.device
         batch_size = rays_o.shape[0]
 
-        # --- Initialization ---
-        # Current ray state
-        curr_rays_o = rays_o.clone()
-        curr_rays_d = rays_d.clone()
-        
-        # Accumulators
-        # Note: final_color starts as zeros but will accumulate gradients from render_core outputs
+        # --- Output accumulators (fixed size, indexed by original pixel) ---
         final_color = torch.zeros(batch_size, 3, device=device)
-        throughput = torch.ones(batch_size, 1, device=device)  # How much light gets through
-        active_mask = torch.ones(batch_size, dtype=torch.bool, device=device)  # Rays still processing
-        
-        # Medium tracking: 1.0 = Air, self.ior = Container/Liquid
-        curr_ior = torch.ones(batch_size, 1, device=device)
-        
-        # Metrics to return (from the first valid volume rendering bounce)
         ret_s_val = torch.zeros(batch_size, 1, device=device)
         ret_weights_sum = torch.zeros(batch_size, 1, device=device)
         ret_gradient_error = torch.tensor(0.0, device=device)
@@ -604,71 +604,82 @@ class NeuSRenderer:
         ret_trans_loss = torch.tensor(0.0, device=device)
         has_rendered_volume = False
 
-        # Iterative ray tracing loop
+        # --- Active ray state (variable size, grows with branching) ---
+        # pixel_idx: which original pixel each active sub-ray belongs to
+        pixel_idx = torch.arange(batch_size, device=device)
+        curr_o = rays_o.clone()
+        curr_d = rays_d.clone()
+        curr_ior = torch.ones(batch_size, device=device)  # 1.0 = Air
+        curr_weight = torch.ones(batch_size, 1, device=device)  # Cumulative Fresnel weight
+
+        # Iterative ray tracing loop with branching
         for bounce in range(self.max_bounces):
-            if not active_mask.any():
+            n_active = len(pixel_idx)
+            if n_active == 0:
                 break
 
             # ------------------------------------------------------------------
             # Step 1: Intersect with Container Mesh
             # ------------------------------------------------------------------
             hit_mask, hit_points, hit_normals, hit_distances = ray_mesh_intersection(
-                curr_rays_o, curr_rays_d, self.ray_tracer
+                curr_o, curr_d, self.ray_tracer
             )
-            
-            # Only update intersections for currently active rays
-            hit_mask = hit_mask & active_mask
-            
-            # ------------------------------------------------------------------
-            # Step 2: Handle Misses (Rays escaping to infinity/background)
-            # ------------------------------------------------------------------
-            escaping_mask = active_mask & (~hit_mask)
-            if escaping_mask.any():
-                if background_rgb is not None:
-                    # Add background color weighted by remaining throughput
-                    final_color[escaping_mask] += throughput[escaping_mask] * background_rgb
-                
-                # These rays are done
-                active_mask[escaping_mask] = False
 
-            if not active_mask.any():
+            # ------------------------------------------------------------------
+            # Step 2: Handle Misses → assign background color
+            # ------------------------------------------------------------------
+            miss_mask = ~hit_mask
+            if miss_mask.any() and background_rgb is not None:
+                # [ReNeuS Sec 4.3] 固定背景色 C_out
+                bg_contrib = curr_weight[miss_mask] * background_rgb
+                final_color.scatter_add_(
+                    0, pixel_idx[miss_mask].unsqueeze(-1).expand(-1, 3), bg_contrib
+                )
+
+            # Filter to hitting rays only
+            if not hit_mask.any():
                 break
-                
+
+            h_idx = torch.where(hit_mask)[0]
+            h_pixel = pixel_idx[h_idx]
+            h_o = curr_o[h_idx]
+            h_d = curr_d[h_idx]
+            h_ior = curr_ior[h_idx]
+            h_weight = curr_weight[h_idx]
+            h_pts = hit_points[h_idx]
+            h_norms = hit_normals[h_idx]
+            h_dists = hit_distances[h_idx]
+            n_hit = len(h_idx)
+
             # ------------------------------------------------------------------
-            # Step 3: Volume Rendering Inside Container
+            # Step 3: Volume Rendering for rays INSIDE the container
             # ------------------------------------------------------------------
-            # Check if we are currently INSIDE the container (curr_ior > 1.0)
-            # If inside, we must volume render before hitting the exit surface
-            is_inside_mask = (curr_ior > 1.0).squeeze() & hit_mask
-            
-            if is_inside_mask.any():
-                # We are inside liquid/glass, marching towards the exit point
-                # Calculate dynamic far bound (distance to exit)
-                dist_to_exit = hit_distances[is_inside_mask]
-                
-                # Setup rendering segment
-                batch_active = is_inside_mask.sum().item()
-                
-                # Create z_vals for this segment
+            is_inside = (h_ior > 1.0)
+
+            if is_inside.any():
+                inside_sel = torch.where(is_inside)[0]
+                batch_active = len(inside_sel)
+
+                dist_to_exit = h_dists[inside_sel]
+                rays_o_active = h_o[inside_sel]
+                rays_d_active = h_d[inside_sel]
+
+                # Create z_vals for this segment (origin → exit surface)
                 z_vals = torch.linspace(0.0, 1.0, self.n_samples, device=device)
                 z_vals = z_vals[None, :].expand(batch_active, -1) * dist_to_exit[:, None]
-                
+
                 # Perturb
                 perturb = self.perturb if perturb_overwrite < 0 else perturb_overwrite
                 if perturb > 0:
                     t_rand = (torch.rand([batch_active, 1], device=device) - 0.5)
                     z_vals = z_vals + t_rand * (dist_to_exit[:, None] / self.n_samples)
 
-                # Get active rays
-                rays_o_active = curr_rays_o[is_inside_mask]
-                rays_d_active = curr_rays_d[is_inside_mask]
-                
                 # Up-sample (Standard NeuS importance sampling)
                 if self.n_importance > 0:
                     with torch.no_grad():
                         pts = rays_o_active[:, None, :] + rays_d_active[:, None, :] * z_vals[..., :, None]
                         sdf = self.sdf_network.sdf(pts.reshape(-1, 3)).reshape(batch_active, self.n_samples)
-                        
+
                         for i in range(self.up_sample_steps):
                             new_z_vals = self.up_sample(
                                 rays_o_active, rays_d_active, z_vals, sdf,
@@ -678,153 +689,134 @@ class NeuSRenderer:
                                 rays_o_active, rays_d_active, z_vals, new_z_vals, sdf,
                                 last=(i + 1 == self.up_sample_steps)
                             )
-                
+
                 # Render Core (Volume Rendering)
                 sample_dist = dist_to_exit.mean().item() / self.n_samples
-                
+
                 ret_fine = self.render_core(
                     rays_o_active, rays_d_active, z_vals, sample_dist,
                     self.sdf_network, self.deviation_network, self.color_network,
-                    background_rgb=None,  # Background added at end of bounces
+                    background_rgb=None,
                     cos_anneal_ratio=cos_anneal_ratio
                 )
-                
-                # Accumulate volume color
+
                 vol_color = ret_fine['color']
                 vol_weights_sum = ret_fine['weights'].sum(dim=-1, keepdim=True)
-                
-                # Add to final color, attenuated by current throughput
-                # Gradient flows through vol_color even if throughput is detached
-                contribution = throughput[is_inside_mask] * vol_color
-                final_color[is_inside_mask] = final_color[is_inside_mask] + contribution
-                
-                # [ReNeuS Eq.15] 累積每條 sub-ray 的 transmittance loss: ||1 - T_ℓ||
-                # vol_weights_sum ≈ 1 - T_ℓ (opacity)，所以 ||1-T|| = weight_sum
+
+                # Accumulate volume color, weighted by Fresnel weight and throughput
+                contribution = h_weight[inside_sel] * vol_color
+                inside_pixels = h_pixel[inside_sel]
+                final_color.scatter_add_(
+                    0, inside_pixels.unsqueeze(-1).expand(-1, 3), contribution
+                )
+
+                # [ReNeuS Eq.15] 累積 sub-ray transmittance loss
                 ret_trans_loss = ret_trans_loss + vol_weights_sum.mean()
-                
-                # Update throughput (light that passed through the object)
-                # [ReNeuS Eq.11] T_new = T_old * (1 - alpha)
-                throughput[is_inside_mask] = throughput[is_inside_mask] * (1.0 - vol_weights_sum).clamp(0.0, 1.0)
-                
-                # Store metrics (from first volume render for training)
+
+                # [ReNeuS Eq.11] Update throughput: T_new = T_old * (1 - opacity)
+                h_weight[inside_sel] = h_weight[inside_sel] * (1.0 - vol_weights_sum).clamp(0.0, 1.0)
+
+                # Store metrics from first volume render (for training diagnostics)
                 if not has_rendered_volume:
                     ret_gradient_error = ret_fine['gradient_error']
-                    ret_s_val[is_inside_mask] = ret_fine['s_val'].reshape(batch_active, -1).mean(dim=-1, keepdim=True)
-                    ret_weights_sum[is_inside_mask] = vol_weights_sum
-                    
-                    # Store gradients/weights (align dimensions)
+                    orig_pixels = inside_pixels
+                    ret_s_val[orig_pixels] = ret_fine['s_val'].reshape(batch_active, -1).mean(dim=-1, keepdim=True)
+                    ret_weights_sum[orig_pixels] = vol_weights_sum
+
                     feat_n_samples = ret_fine['gradients'].shape[1]
                     if feat_n_samples >= self.n_samples:
-                        ret_gradients[is_inside_mask] = ret_fine['gradients'][:, :self.n_samples, :]
-                        ret_weights[is_inside_mask] = ret_fine['weights'][:, :self.n_samples]
-                    
+                        ret_gradients[orig_pixels] = ret_fine['gradients'][:, :self.n_samples, :]
+                        ret_weights[orig_pixels] = ret_fine['weights'][:, :self.n_samples]
+
                     has_rendered_volume = True
-                
-                # Early termination: If throughput is very low (opaque object), kill ray
-                low_throughput = (throughput[is_inside_mask] < 1e-3).squeeze()
-                if low_throughput.any():
-                    # Map back to full batch
-                    inside_indices = torch.where(is_inside_mask)[0]
-                    rays_to_kill = inside_indices[low_throughput]
-                    active_mask[rays_to_kill] = False
 
             # ------------------------------------------------------------------
-            # Step 4: Compute Refraction/Reflection at Surface
+            # Step 4: Deterministic Branching at Interface (Eq.8-9)
             # ------------------------------------------------------------------
-            # For all rays that hit the container surface
-            hit_indices = torch.where(hit_mask)[0]
-            
-            if len(hit_indices) == 0:
-                break
-            
-            # Prepare inputs
-            d_in = curr_rays_d[hit_indices]
-            n_surf = hit_normals[hit_indices]
-            
-            # Determine IORs (entering vs exiting)
-            ior1 = curr_ior[hit_indices]
+            # [ReNeuS Eq.8] C(ℓ) = R · C(ℓ_r) + T_re · C(ℓ_t)
+            # 在每個界面同時產生反射+折射兩組 ray
+
+            # Determine IOR transition
+            ior1 = h_ior
             ior2 = torch.where(
                 ior1 == 1.0,
-                torch.tensor(self.ior, device=device),
-                torch.tensor(1.0, device=device)
+                torch.full_like(ior1, self.ior),
+                torch.ones_like(ior1)
             )
-            
-            # Compute Refraction
-            d_refract, valid_refract = compute_refraction(d_in, n_surf, ior1, ior2)
-            
-            # Handle Total Internal Reflection (TIR)
-            # If refraction is invalid, use reflection
+
+            # Compute Fresnel coefficient R (Eq.8-9, natural light assumption)
+            cos_theta_i = torch.abs((h_d * h_norms).sum(dim=-1))
+            fresnel_R = compute_fresnel(cos_theta_i, ior1, ior2)
+
+            # Compute reflection direction (always valid)
+            d_reflect = compute_reflection(h_d, h_norms)
+
+            # Compute refraction direction (may fail for TIR)
+            d_refract, valid_refract = compute_refraction(
+                h_d, h_norms, ior1, ior2
+            )
+
+            # TIR: Fresnel R = 1.0 (full reflection, no refraction branch)
             tir_mask = ~valid_refract
-            d_reflect = compute_reflection(d_in, n_surf)
-            
-            # Apply Fresnel weighting if enabled
-            if self.use_fresnel_weighted and self.fresnel_mode == 'stochastic':
-                # Method 1: Stochastic sampling (paper's original method)
-                # Compute Fresnel coefficient
-                cos_theta_i = torch.abs((d_in * n_surf).sum(dim=-1))
-                fresnel_coef = compute_fresnel(cos_theta_i, ior1.squeeze(), ior2.squeeze())
-                
-                # For TIR cases, Fresnel coefficient is 1.0 (full reflection)
-                # Already handled in compute_fresnel, but enforce here for clarity
-                fresnel_coef = torch.where(tir_mask, torch.ones_like(fresnel_coef), fresnel_coef)
-                
-                # Randomly sample reflection vs refraction based on Fresnel coefficient
-                # Use detach() to prevent gradient flow through the random sampling
-                # This makes the sampling non-differentiable (as it should be for stochastic mode)
-                rand_samples = torch.rand(len(hit_indices), device=device)
-                use_reflection = rand_samples < fresnel_coef.detach()
-                
-                # Select direction: reflection or refraction
-                next_d = torch.where(use_reflection[:, None], d_reflect, d_refract)
-                
-                # Update IOR (only for refracted rays that are not TIR)
-                new_ior = ior1.clone()
-                # Only change IOR for rays that refract (not reflect and not TIR)
-                refract_mask = ~use_reflection & valid_refract
-                new_ior[refract_mask] = ior2[refract_mask]
-                
-            else:
-                # Original behavior: use refraction, fallback to reflection only for TIR
-                next_d = torch.where(tir_mask[:, None], d_reflect, d_refract)
-                
-                # Update IOR (only for successfully refracted rays)
-                new_ior = ior1.clone()
-                new_ior[valid_refract] = ior2[valid_refract]
-            
-            # Update global state
-            curr_rays_d[hit_indices] = next_d
-            # Offset origin to avoid self-intersection
-            curr_rays_o[hit_indices] = hit_points[hit_indices] + 1e-4 * next_d
-            curr_ior[hit_indices] = new_ior
+            fresnel_R = torch.where(tir_mask, torch.ones_like(fresnel_R), fresnel_R)
+            fresnel_T = 1.0 - fresnel_R
+
+            # --- Build next iteration's ray bundles ---
+            # Reflection branch: all rays reflect, weight *= R
+            reflect_o = h_pts + 1e-4 * d_reflect
+            reflect_ior = ior1  # Stays in same medium
+
+            # Refraction branch: only non-TIR rays, weight *= T
+            refract_valid = valid_refract
+            refract_o = h_pts[refract_valid] + 1e-4 * d_refract[refract_valid]
+            refract_ior = ior2[refract_valid]  # Transitions to other medium
+
+            # Concatenate both branches for next bounce
+            next_pixel_idx = torch.cat([h_pixel, h_pixel[refract_valid]])
+            next_o = torch.cat([reflect_o, refract_o])
+            next_d = torch.cat([d_reflect, d_refract[refract_valid]])
+            next_ior = torch.cat([reflect_ior, refract_ior])
+            next_weight = torch.cat([
+                h_weight * fresnel_R.unsqueeze(-1),
+                h_weight[refract_valid] * fresnel_T[refract_valid].unsqueeze(-1)
+            ])
+
+            # Update active ray state for next iteration
+            pixel_idx = next_pixel_idx
+            curr_o = next_o
+            curr_d = next_d
+            curr_ior = next_ior
+            curr_weight = next_weight
 
         # ------------------------------------------------------------------
-        # End of Iterative Loop
+        # End of Iterative Loop: assign background to remaining active rays
         # ------------------------------------------------------------------
-        
+        if len(pixel_idx) > 0 and background_rgb is not None:
+            bg_contrib = curr_weight * background_rgb
+            final_color.scatter_add_(
+                0, pixel_idx.unsqueeze(-1).expand(-1, 3), bg_contrib
+            )
+
         # Ensure gradient flow even if no rays entered the container
-        # This can happen at early training stages or with bad initialization
         if not has_rendered_volume:
-            # Create a dummy gradient connection to prevent "no grad_fn" error
-            # This will produce black output but maintain gradient flow
-            dummy_sdf = self.sdf_network.sdf(rays_o[:1])  # Query SDF for one point
-            final_color = final_color + dummy_sdf.sum() * 0.0  # Add zero but keep gradient
-            ret_gradient_error = torch.tensor(0.01, device=device, requires_grad=True)  # Small penalty
-        
-        # Gamma Correction (Eq.12): I = C^(1/2.2)
-        # 論文假設 appearance MLP 輸出 linear space，需要 gamma correction
+            dummy_sdf = self.sdf_network.sdf(rays_o[:1])
+            final_color = final_color + dummy_sdf.sum() * 0.0
+            ret_gradient_error = torch.tensor(0.01, device=device, requires_grad=True)
+
+        # [ReNeuS Eq.12] Gamma Correction: I = C^(1/2.2)
         final_color = torch.clamp(final_color, 0.0, 1.0)
         final_color = torch.pow(final_color + 1e-8, 1.0 / 2.2)
-        
+
         return {
             'color_fine': final_color,
             's_val': ret_s_val,
-            'cdf_fine': torch.zeros(batch_size, self.n_samples, device=device),  # Placeholder for compatibility
+            'cdf_fine': torch.zeros(batch_size, self.n_samples, device=device),
             'weight_sum': ret_weights_sum,
             'weight_max': ret_weights_sum,
             'gradient_error': ret_gradient_error,
             'gradients': ret_gradients,
             'weights': ret_weights,
-            'trans_loss': ret_trans_loss,  # [ReNeuS Eq.15] 累積所有 sub-ray 的 transmittance loss
+            'trans_loss': ret_trans_loss,  # [ReNeuS Eq.15]
         }
 
     def render(self, rays_o, rays_d, near, far, perturb_overwrite=-1, background_rgb=None, cos_anneal_ratio=0.0):
