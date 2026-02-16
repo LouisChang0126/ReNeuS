@@ -6,6 +6,13 @@ from models.embedder import get_embedder
 
 
 # This implementation is borrowed from IDR: https://github.com/lioryariv/idr
+
+# =============================================================================
+# [ReNeuS] SIREN Activation (論文 Sec 4.3, [28])
+# NeuS 原版使用 Softplus(beta=100) 作為激活函數。
+# ReNeuS 將其替換為 SIREN (Sinusoidal Representation Networks) 的週期激活函數，
+# 因為 SIREN 對神經隱式表示有更強的描述能力。
+# =============================================================================
 class SineLayer(nn.Module):
     def __init__(self, in_features, out_features, bias=True, is_first=False, omega_0=30):
         super().__init__()
@@ -41,7 +48,11 @@ class SDFNetwork(nn.Module):
                  inside_outside=False):
         super(SDFNetwork, self).__init__()
 
-        # SIREN implementation for ReNeuS
+        # [ReNeuS] SIREN 改造說明 (vs NeuS 原版):
+        # - NeuS: 所有隱藏層使用 nn.Linear + Softplus(beta=100)
+        # - ReNeuS: 隱藏層使用 SineLayer (sin(ω₀·Wx+b))，最後一層保持 nn.Linear
+        # - NeuS 的 geometric init 對隱藏層有特殊初始化，ReNeuS 用 SIREN 自帶的初始化
+        # - NeuS 有 sdf_hidden_appearance() 方法，ReNeuS 不需要（已移除）
         dims = [d_in] + [d_hidden for _ in range(n_layers)] + [d_out]
 
         self.embed_fn_fine = None
@@ -61,9 +72,11 @@ class SDFNetwork(nn.Module):
             else:
                 out_dim = dims[l + 1]
 
-            # 只對非最後一層使用 SIREN 激活
+            # [ReNeuS] 只對非最後一層使用 SIREN 激活
+            # NeuS 原版：所有層用 nn.Linear，forward 時手動呼叫 self.activation(x)
+            # ReNeuS：隱藏層改用 SineLayer (內建 sin 激活)，最後一層保持 nn.Linear
             if l < self.num_layers - 2:
-                # 隱藏層：使用 SineLayer
+                # [ReNeuS] 隱藏層：使用 SineLayer (sin(ω₀·Wx+b))
                 if l == 0:
                     layer = SineLayer(dims[l], out_dim, is_first=True, omega_0=30.0)
                 else:
@@ -89,6 +102,10 @@ class SDFNetwork(nn.Module):
 
             setattr(self, "lin" + str(l), layer)
 
+    # [ReNeuS] forward 與 NeuS 原版差異：
+    # - NeuS: 每層後手動呼叫 self.activation = nn.Softplus(beta=100)
+    # - ReNeuS: SineLayer 內建激活 (sin)，forward 中不需要額外呼叫 activation
+    # - NeuS: 有 sdf_hidden_appearance(x) 方法返回中間表示，ReNeuS 已移除
     def forward(self, inputs):
         inputs = inputs * self.scale
         if self.embed_fn_fine is not None:

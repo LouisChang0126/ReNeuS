@@ -50,9 +50,10 @@ class Runner:
         self.anneal_end = self.conf.get_float('train.anneal_end', default=0.0)
 
         # Weights
-        self.igr_weight = self.conf.get_float('train.igr_weight')
+        self.igr_weight = self.conf.get_float('train.igr_weight')  # λ₂: Eikonal (Eq.16)
         self.mask_weight = self.conf.get_float('train.mask_weight')
-        self.trans_weight = self.conf.get_float('train.trans_weight', default=0.1)  # ReNeuS Eq.13
+        # [ReNeuS] 新增：NeuS 原版無此參數。論文 Eq.13: L = L_color + λ₁ L_trans + λ₂ L_reg
+        self.trans_weight = self.conf.get_float('train.trans_weight', default=0.1)
         self.is_continue = is_continue
         self.mode = mode
         self.model_list = []
@@ -64,7 +65,10 @@ class Runner:
         self.sdf_network = SDFNetwork(**self.conf['model.sdf_network']).to(self.device)
         self.deviation_network = SingleVarianceNetwork(**self.conf['model.variance_network']).to(self.device)
         self.color_network = RenderingNetwork(**self.conf['model.rendering_network']).to(self.device)
-        # ReNeuS: Do NOT train nerf_outside (論文使用固定背景，非 NeRF++)
+        # [ReNeuS] 與 NeuS 原版差異：
+        # NeuS 原版將 nerf_outside 參數加入優化器，用於學習 NeRF++ 背景。
+        # ReNeuS 論文 Sec 3.2 與 4.3 明確使用固定背景 C_out=[0.8,0.8,0.8]，
+        # 因此不訓練 nerf_outside，避免網絡學習背景而非使用固定值。
         # params_to_train += list(self.nerf_outside.parameters())
         params_to_train += list(self.sdf_network.parameters())
         params_to_train += list(self.deviation_network.parameters())
@@ -72,7 +76,8 @@ class Runner:
 
         self.optimizer = torch.optim.Adam(params_to_train, lr=self.learning_rate)
 
-        # ReNeuS: Get parameters from dataset metadata or config
+        # [ReNeuS] 新增：從 dataset metadata 或 config 讀取容器參數
+        # NeuS 原版不需要容器資訊，ReNeuS 需要容器 mesh 和 IOR 來做光線追蹤
         container_mesh_path = getattr(self.dataset, 'container_mesh_path', None)
         ior = getattr(self.dataset, 'ior', 1.5)
         max_bounces = self.conf.get_int('model.reneus.max_bounces', default=3) if 'model.reneus' in self.conf else 3
@@ -83,16 +88,17 @@ class Runner:
         if 'model.reneus.ior' in self.conf:
             ior = self.conf.get_float('model.reneus.ior')
 
+        # [ReNeuS] 與 NeuS 原版差異：傳入額外的容器/折射參數
         self.renderer = NeuSRenderer(self.nerf_outside,
                                      self.sdf_network,
                                      self.deviation_network,
                                      self.color_network,
                                      **self.conf['model.neus_renderer'],
-                                     container_mesh_path=container_mesh_path,
-                                     ior=ior,
-                                     max_bounces=max_bounces,
-                                     use_fresnel_weighted=use_fresnel_weighted,
-                                     fresnel_mode=fresnel_mode)
+                                     container_mesh_path=container_mesh_path,  # [ReNeuS] 新增
+                                     ior=ior,                                  # [ReNeuS] 新增
+                                     max_bounces=max_bounces,                  # [ReNeuS] 新增
+                                     use_fresnel_weighted=use_fresnel_weighted, # [ReNeuS] 新增
+                                     fresnel_mode=fresnel_mode)                # [ReNeuS] 新增
 
 
         # Load checkpoint
@@ -128,7 +134,9 @@ class Runner:
 
             background_rgb = None
             if self.use_white_bkgd:
-                # ReNeuS 論文：固定背景色 [0.8, 0.8, 0.8] (before gamma correction)
+                # [ReNeuS] 與 NeuS 原版差異：
+                # NeuS: background_rgb = torch.ones([1, 3])  ← 白色 [1,1,1]
+                # ReNeuS: 論文 Sec 4.3 明確 C_out = [0.8, 0.8, 0.8] (before gamma correction)
                 background_rgb = torch.tensor([[0.8, 0.8, 0.8]])
 
             if self.mask_weight > 0.0:
@@ -157,9 +165,9 @@ class Runner:
 
             mask_loss = F.binary_cross_entropy(weight_sum.clip(1e-3, 1.0 - 1e-3), mask)
             
-            # ReNeuS Transmittance Loss (Eq.15): Sparsity prior
-            # 強制容器內部（除物體外）透明
-            trans_loss = weight_sum.mean()
+            # [ReNeuS Eq.15] Transmittance Loss: Sparsity prior
+            # 使用所有 sub-ray 累積的 trans_loss，而非僅第一次 bounce
+            trans_loss = render_out['trans_loss']
 
             loss = color_fine_loss +\
                    eikonal_loss * self.igr_weight +\

@@ -8,7 +8,13 @@ from icecream import ic
 
 
 # ==============================================================================
-# ReNeuS: Ray Tracing Utility Functions
+# [ReNeuS] 新增：光線追蹤工具函數 (論文 Sec 3.3)
+# NeuS 原版不包含以下函數。ReNeuS 新增了：
+#   - compute_refraction(): Snell's Law 折射計算 (Eq.7)
+#   - compute_reflection(): 反射定律 (Eq.7)
+#   - compute_fresnel(): Fresnel 方程式, natural light assumption (Eq.8-9)
+#   - check_total_internal_reflection(): TIR 檢查
+#   - ray_mesh_intersection(): trimesh 的光線-容器交叉檢測
 # ==============================================================================
 
 def compute_refraction(ray_d, normal, ior_in, ior_out):
@@ -329,13 +335,17 @@ class NeuSRenderer:
         self.up_sample_steps = up_sample_steps
         self.perturb = perturb
         
-        # ReNeuS extensions
+        # [ReNeuS] 新增參數 (NeuS 原版不包含)
+        # - ior: 容器折射率 (論文 Sec 4.3)
+        # - max_bounces: 過遞深度 Dre (論文 Sec 3.3, 實驗用 2)
+        # - use_fresnel_weighted: 是否使用 Fresnel 加權 (論文 Eq.8-9)
+        # - fresnel_mode: 採樣策略 ('stochastic' 近似論文的累積)
         self.ior = ior
         self.max_bounces = max_bounces
         self.use_fresnel_weighted = use_fresnel_weighted
         self.fresnel_mode = fresnel_mode  # 'stochastic' or 'weighted_accumulation'
-        self.container_mesh = None
-        self.ray_tracer = None
+        self.container_mesh = None  # [ReNeuS] NeuS 原版無容器 mesh
+        self.ray_tracer = None  # [ReNeuS] trimesh ray tracer 實例
         
         if container_mesh_path is not None:
             try:
@@ -557,13 +567,15 @@ class NeuSRenderer:
 
     def render_with_refraction(self, rays_o, rays_d, near, far, perturb_overwrite=-1, background_rgb=None, cos_anneal_ratio=0.0):
         """
-        ReNeuS Iterative Rendering with Max Bounces = K (default 3)
-        
-        Implements physically correct ray tracing with:
-        - Multiple bounces (Entry -> Volume Render Inside -> Exit -> Background)
-        - Total Internal Reflection (TIR) handling
-        - Dynamic near/far bounds based on container exit points
-        - Proper throughput accumulation
+        [ReNeuS] 迭代折射渲染 (論文 Sec 3.3, Eq.7-12)
+        NeuS 原版的 render() 方法僅做單次體渲染。
+        ReNeuS 新增本方法以實現：
+        - 多次彈跳光線追蹤 (Entry -> Volume Render -> Exit -> Background)
+        - Fresnel 加權的反射/折射採樣 (Eq.8-9)
+        - 全內反射 (TIR) 處理
+        - Throughput 累積 (Eq.11: T = exp(-∫ρds))
+        - Gamma Correction (Eq.12: I = C^(1/2.2))
+        - 固定背景色 C_out (Sec 4.3)
         """
         device = rays_o.device
         batch_size = rays_o.shape[0]
@@ -588,6 +600,8 @@ class NeuSRenderer:
         ret_gradient_error = torch.tensor(0.0, device=device)
         ret_gradients = torch.zeros(batch_size, self.n_samples, 3, device=device)
         ret_weights = torch.zeros(batch_size, self.n_samples, device=device)
+        # [ReNeuS Eq.15] Transmittance loss 累積器：sum over all sub-rays of ||1-T_ℓ||
+        ret_trans_loss = torch.tensor(0.0, device=device)
         has_rendered_volume = False
 
         # Iterative ray tracing loop
@@ -684,8 +698,12 @@ class NeuSRenderer:
                 contribution = throughput[is_inside_mask] * vol_color
                 final_color[is_inside_mask] = final_color[is_inside_mask] + contribution
                 
+                # [ReNeuS Eq.15] 累積每條 sub-ray 的 transmittance loss: ||1 - T_ℓ||
+                # vol_weights_sum ≈ 1 - T_ℓ (opacity)，所以 ||1-T|| = weight_sum
+                ret_trans_loss = ret_trans_loss + vol_weights_sum.mean()
+                
                 # Update throughput (light that passed through the object)
-                # T_new = T_old * (1 - alpha)
+                # [ReNeuS Eq.11] T_new = T_old * (1 - alpha)
                 throughput[is_inside_mask] = throughput[is_inside_mask] * (1.0 - vol_weights_sum).clamp(0.0, 1.0)
                 
                 # Store metrics (from first volume render for training)
@@ -806,10 +824,14 @@ class NeuSRenderer:
             'gradient_error': ret_gradient_error,
             'gradients': ret_gradients,
             'weights': ret_weights,
+            'trans_loss': ret_trans_loss,  # [ReNeuS Eq.15] 累積所有 sub-ray 的 transmittance loss
         }
 
     def render(self, rays_o, rays_d, near, far, perturb_overwrite=-1, background_rgb=None, cos_anneal_ratio=0.0):
-        # ReNeuS: If container mesh is loaded, apply refraction-aware rendering
+        # [ReNeuS] 與 NeuS 原版差異：
+        # - NeuS: 直接做單次體渲染 + NeRF++ 背景
+        # - ReNeuS: 轉發到 render_with_refraction()，做多次彈跳光線追蹤
+        # NeuS 原版的渲染邏輯已保留在下方註解中供參考
         if self.container_mesh is not None:
             return self.render_with_refraction(
                 rays_o, rays_d, near, far, perturb_overwrite, background_rgb, cos_anneal_ratio

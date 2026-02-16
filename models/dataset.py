@@ -92,7 +92,11 @@ class Dataset:
         self.object_bbox_min = object_bbox_min[:3, 0]
         self.object_bbox_max = object_bbox_max[:3, 0]
 
-        # ReNeuS: Load metadata if available
+        # [ReNeuS] 新增：從 metadata.json 讀取容器資訊
+        # NeuS 原版不需要容器資訊。ReNeuS 需要：
+        # - IOR: 容器折射率 (論文 Sec 4.1: synthetic data 用 1.45)
+        # - container_mesh_path: 容器幾何 mesh (論文 Sec 4.3: 已知幾何)
+        # - object_mesh_path: 物體 mesh (僅供驗證/參考)
         self.ior = None
         self.container_mesh_path = None
         self.object_mesh_path = None
