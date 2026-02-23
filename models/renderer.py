@@ -411,8 +411,8 @@ class NeuSRenderer:
         """
         batch_size, n_samples = z_vals.shape
         pts = rays_o[:, None, :] + rays_d[:, None, :] * z_vals[..., :, None]  # n_rays, n_samples, 3
-        radius = torch.linalg.norm(pts, ord=2, dim=-1, keepdim=False)
-        inside_sphere = (radius[:, :-1] < 1.0) | (radius[:, 1:] < 1.0)
+        # [ReNeuS] 容器內所有採樣點都有效，不需 unit sphere 判定
+        inside_sphere = torch.ones(batch_size, n_samples - 1, dtype=torch.bool, device=z_vals.device)
         sdf = sdf.reshape(batch_size, n_samples)
         prev_sdf, next_sdf = sdf[:, :-1], sdf[:, 1:]
         prev_z_vals, next_z_vals = z_vals[:, :-1], z_vals[:, 1:]
@@ -475,8 +475,6 @@ class NeuSRenderer:
                     sdf_network,
                     deviation_network,
                     color_network,
-                    background_alpha=None,
-                    background_sampled_color=None,
                     background_rgb=None,
                     cos_anneal_ratio=0.0):
         batch_size, n_samples = z_vals.shape
@@ -522,17 +520,10 @@ class NeuSRenderer:
 
         alpha = ((p + 1e-5) / (c + 1e-5)).reshape(batch_size, n_samples).clip(0.0, 1.0)
 
-        pts_norm = torch.linalg.norm(pts, ord=2, dim=-1, keepdim=True).reshape(batch_size, n_samples)
-        inside_sphere = (pts_norm < 1.0).float().detach()
-        relax_inside_sphere = (pts_norm < 1.2).float().detach()
-
-        # Render with background
-        if background_alpha is not None:
-            alpha = alpha * inside_sphere + background_alpha[:, :n_samples] * (1.0 - inside_sphere)
-            alpha = torch.cat([alpha, background_alpha[:, n_samples:]], dim=-1)
-            sampled_color = sampled_color * inside_sphere[:, :, None] +\
-                            background_sampled_color[:, :n_samples] * (1.0 - inside_sphere)[:, :, None]
-            sampled_color = torch.cat([sampled_color, background_sampled_color[:, n_samples:]], dim=1)
+        # [ReNeuS] 容器內所有採樣點都有效，不需 unit sphere 判定
+        # NeuS 原版用 inside_sphere 區分 SDF/NeRF++ 區域，ReNeuS 不需要 (n_outside=0)
+        inside_sphere = torch.ones(batch_size, n_samples, device=pts.device)
+        relax_inside_sphere = inside_sphere
 
         weights = alpha * torch.cumprod(torch.cat([torch.ones([batch_size, 1]), 1. - alpha + 1e-7], -1), -1)[:, :-1]
         weights_sum = weights.sum(dim=-1, keepdim=True)
@@ -649,8 +640,11 @@ class NeuSRenderer:
                     0, pixel_idx[miss_mask].unsqueeze(-1).expand(-1, 3), bg_contrib
                 )
 
-            # Filter to hitting rays only
+            # Filter to hitting rays only, removing miss rays from active set
+            # (miss rays already got background above, must not be processed again)
             if not hit_mask.any():
+                # All rays missed → clear active set so post-loop won't double-add bg
+                pixel_idx = pixel_idx[:0]
                 break
 
             h_idx = torch.where(hit_mask)[0]
