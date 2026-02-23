@@ -81,8 +81,6 @@ class Runner:
         container_mesh_path = getattr(self.dataset, 'container_mesh_path', None)
         ior = getattr(self.dataset, 'ior', 1.5)
         max_bounces = self.conf.get_int('model.reneus.max_bounces', default=3) if 'model.reneus' in self.conf else 3
-        use_fresnel_weighted = self.conf.get_bool('model.reneus.use_fresnel_weighted', default=True) if 'model.reneus' in self.conf else True
-        fresnel_mode = self.conf.get_string('model.reneus.fresnel_mode', default='stochastic') if 'model.reneus' in self.conf else 'stochastic'
         
         # Override IOR from config if specified
         if 'model.reneus.ior' in self.conf:
@@ -96,9 +94,7 @@ class Runner:
                                      **self.conf['model.neus_renderer'],
                                      container_mesh_path=container_mesh_path,  # [ReNeuS] 新增
                                      ior=ior,                                  # [ReNeuS] 新增
-                                     max_bounces=max_bounces,                  # [ReNeuS] 新增
-                                     use_fresnel_weighted=use_fresnel_weighted, # [ReNeuS] 新增
-                                     fresnel_mode=fresnel_mode)                # [ReNeuS] 新增
+                                     max_bounces=max_bounces)                  # [ReNeuS] 新增
 
 
         # Load checkpoint
@@ -167,9 +163,9 @@ class Runner:
             # ReNeuS: 論文 Sec 4.3 明確移除 mask loss
             # mask_loss = F.binary_cross_entropy(weight_sum.clip(1e-3, 1.0 - 1e-3), mask)
             
-            # [ReNeuS Eq.15] Transmittance Loss: Sparsity prior
-            # 使用所有 sub-ray 累積的 trans_loss，而非僅第一次 bounce
-            trans_loss = render_out['trans_loss']
+            # [ReNeuS Eq.15] Transmittance Loss: L_trans = (1/|M_in|) Σ ||1-T_ℓ||
+            # renderer 返回的是 sum，這裡除以 |M_in| 做 normalization
+            trans_loss = render_out['trans_loss'] / mask_sum
 
             loss = color_fine_loss +\
                    eikonal_loss * self.igr_weight +\
@@ -297,7 +293,9 @@ class Runner:
             if feasible('color_fine'):
                 out_rgb_fine.append(render_out['color_fine'].detach().cpu().numpy())
             if feasible('gradients') and feasible('weights'):
-                n_samples = self.renderer.n_samples + self.renderer.n_importance
+                # ret_gradients/ret_weights 維度為 [batch, n_samples]（coarse only）
+                # n_samples = self.renderer.n_samples + self.renderer.n_importance
+                n_samples = self.renderer.n_samples
                 normals = render_out['gradients'] * render_out['weights'][:, :n_samples, None]
                 if feasible('inside_sphere'):
                     normals = normals * render_out['inside_sphere'][..., None]
@@ -344,7 +342,7 @@ class Runner:
         out_rgb_fine = []
         for rays_o_batch, rays_d_batch in zip(rays_o, rays_d):
             near, far = self.dataset.near_far_from_sphere(rays_o_batch, rays_d_batch)
-            background_rgb = torch.ones([1, 3]) if self.use_white_bkgd else None
+            background_rgb = torch.tensor([[0.8, 0.8, 0.8]]) if self.use_white_bkgd else None
 
             render_out = self.renderer.render(rays_o_batch,
                                               rays_d_batch,

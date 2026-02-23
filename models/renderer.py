@@ -322,9 +322,7 @@ class NeuSRenderer:
                  perturb,
                  container_mesh_path=None,
                  ior=1.5,
-                 max_bounces=3,
-                 use_fresnel_weighted=True,
-                 fresnel_mode='stochastic'):
+                 max_bounces=3):
         self.nerf = nerf
         self.sdf_network = sdf_network
         self.deviation_network = deviation_network
@@ -337,13 +335,9 @@ class NeuSRenderer:
         
         # [ReNeuS] 新增參數 (NeuS 原版不包含)
         # - ior: 容器折射率 (論文 Sec 4.3)
-        # - max_bounces: 過遞深度 Dre (論文 Sec 3.3, 實驗用 2)
-        # - use_fresnel_weighted: 是否使用 Fresnel 加權 (論文 Eq.8-9)
-        # - fresnel_mode: 採樣策略 ('stochastic' 近似論文的累積)
+        # - max_bounces: 遞迴深度 Dre (論文 Sec 3.3, 實驗用 2)
         self.ior = ior
         self.max_bounces = max_bounces
-        self.use_fresnel_weighted = use_fresnel_weighted
-        self.fresnel_mode = fresnel_mode  # 'stochastic' or 'weighted_accumulation'
         self.container_mesh = None  # [ReNeuS] NeuS 原版無容器 mesh
         self.ray_tracer = None  # [ReNeuS] trimesh ray tracer 實例
         
@@ -565,10 +559,10 @@ class NeuSRenderer:
             'inside_sphere': inside_sphere
         }
 
-    def render_with_refraction(self, rays_o, rays_d, near, far, perturb_overwrite=-1, background_rgb=None, cos_anneal_ratio=0.0):
+    def render(self, rays_o, rays_d, near, far, perturb_overwrite=-1, background_rgb=None, cos_anneal_ratio=0.0):
         """
         [ReNeuS] Deterministic Branching 渲染 (論文 Sec 3.3, Eq.7-12)
-        
+
         NeuS 原版的 render() 方法僅做單次體渲染。
         ReNeuS 新增本方法以實現論文的 "hybrid rendering strategy"：
         
@@ -589,45 +583,64 @@ class NeuSRenderer:
         - Throughput 累積 (Eq.11: T = exp(-∫ρds))
         - Gamma Correction (Eq.12: I = C^(1/2.2))
         - 固定背景色 C_out (Sec 4.3)
+
+        與 NeuS 原版 render() 的結構對照：
+        ┌─────────────────────────────────────────────────────────┐
+        │ NeuS render()              │ ReNeuS render()            │
+        ├────────────────────────────┼────────────────────────────┤
+        │ 1. z_vals (near→far)       │ 1. Iterative ray tracing   │
+        │ 2. Perturb                 │    with branching (Eq.8)   │
+        │ 3. Up-sample (importance)  │    - Container intersection│
+        │ 4. Background model        │    - Volume render inside  │
+        │ 5. render_core             │    - Fresnel split         │
+        │ 6. Pack & return           │ 2. Background (fixed 0.8)  │
+        │                            │ 3. Gamma correction (Eq.12)│
+        │                            │ 4. Pack & return           │
+        └────────────────────────────┴────────────────────────────┘
         """
         device = rays_o.device
-        batch_size = rays_o.shape[0]
+        batch_size = len(rays_o)
 
-        # --- Output accumulators (fixed size, indexed by original pixel) ---
+        # =====================================================================
+        # Output accumulators (fixed size, indexed by original pixel)
+        # Corresponds to NeuS: color_fine, s_val, weights_sum, gradients, etc.
+        # =====================================================================
         final_color = torch.zeros(batch_size, 3, device=device)
         ret_s_val = torch.zeros(batch_size, 1, device=device)
         ret_weights_sum = torch.zeros(batch_size, 1, device=device)
         ret_gradient_error = torch.tensor(0.0, device=device)
         ret_gradients = torch.zeros(batch_size, self.n_samples, 3, device=device)
         ret_weights = torch.zeros(batch_size, self.n_samples, device=device)
+        ret_inside_sphere = torch.zeros(batch_size, self.n_samples, device=device)
         # [ReNeuS Eq.15] Transmittance loss 累積器：sum over all sub-rays of ||1-T_ℓ||
         ret_trans_loss = torch.tensor(0.0, device=device)
         has_rendered_volume = False
 
-        # --- Active ray state (variable size, grows with branching) ---
+        # =====================================================================
+        # Active ray state (variable size, grows with branching)
         # pixel_idx: which original pixel each active sub-ray belongs to
+        # =====================================================================
         pixel_idx = torch.arange(batch_size, device=device)
         curr_o = rays_o.clone()
         curr_d = rays_d.clone()
-        curr_ior = torch.ones(batch_size, device=device)  # 1.0 = Air
-        curr_weight = torch.ones(batch_size, 1, device=device)  # Cumulative Fresnel weight
+        curr_ior = torch.ones(batch_size, device=device)          # 1.0 = Air
+        curr_weight = torch.ones(batch_size, 1, device=device)    # Cumulative Fresnel weight
 
-        # Iterative ray tracing loop with branching
+        # =====================================================================
+        # Iterative ray tracing with deterministic branching
+        # NeuS: single render_core call. ReNeuS: loop over bounces.
+        # =====================================================================
         for bounce in range(self.max_bounces):
             n_active = len(pixel_idx)
             if n_active == 0:
                 break
 
-            # ------------------------------------------------------------------
-            # Step 1: Intersect with Container Mesh
-            # ------------------------------------------------------------------
+            # ----- Step 1: Intersect with Container Mesh -----
             hit_mask, hit_points, hit_normals, hit_distances = ray_mesh_intersection(
                 curr_o, curr_d, self.ray_tracer
             )
 
-            # ------------------------------------------------------------------
-            # Step 2: Handle Misses → assign background color
-            # ------------------------------------------------------------------
+            # ----- Step 2: Handle Misses → background -----
             miss_mask = ~hit_mask
             if miss_mask.any() and background_rgb is not None:
                 # [ReNeuS Sec 4.3] 固定背景色 C_out
@@ -649,11 +662,10 @@ class NeuSRenderer:
             h_pts = hit_points[h_idx]
             h_norms = hit_normals[h_idx]
             h_dists = hit_distances[h_idx]
-            n_hit = len(h_idx)
 
-            # ------------------------------------------------------------------
-            # Step 3: Volume Rendering for rays INSIDE the container
-            # ------------------------------------------------------------------
+            # ----- Step 3: Volume Rendering inside container -----
+            # NeuS: single render_core with z_vals from near→far
+            # ReNeuS: render_core for rays INSIDE container (IOR > 1)
             is_inside = (h_ior > 1.0)
 
             if is_inside.any():
@@ -664,17 +676,17 @@ class NeuSRenderer:
                 rays_o_active = h_o[inside_sel]
                 rays_d_active = h_d[inside_sel]
 
-                # Create z_vals for this segment (origin → exit surface)
+                # --- z_vals (NeuS: near→far, ReNeuS: origin→exit) ---
                 z_vals = torch.linspace(0.0, 1.0, self.n_samples, device=device)
                 z_vals = z_vals[None, :].expand(batch_active, -1) * dist_to_exit[:, None]
 
-                # Perturb
+                # --- Perturb (same as NeuS) ---
                 perturb = self.perturb if perturb_overwrite < 0 else perturb_overwrite
                 if perturb > 0:
                     t_rand = (torch.rand([batch_active, 1], device=device) - 0.5)
                     z_vals = z_vals + t_rand * (dist_to_exit[:, None] / self.n_samples)
 
-                # Up-sample (Standard NeuS importance sampling)
+                # --- Up-sample / importance sampling (same as NeuS) ---
                 if self.n_importance > 0:
                     with torch.no_grad():
                         pts = rays_o_active[:, None, :] + rays_d_active[:, None, :] * z_vals[..., :, None]
@@ -690,7 +702,7 @@ class NeuSRenderer:
                                 last=(i + 1 == self.up_sample_steps)
                             )
 
-                # Render Core (Volume Rendering)
+                # --- Render core (same as NeuS) ---
                 sample_dist = dist_to_exit.mean().item() / self.n_samples
 
                 ret_fine = self.render_core(
@@ -703,20 +715,21 @@ class NeuSRenderer:
                 vol_color = ret_fine['color']
                 vol_weights_sum = ret_fine['weights'].sum(dim=-1, keepdim=True)
 
-                # Accumulate volume color, weighted by Fresnel weight and throughput
+                # --- Accumulate (NeuS: direct assign. ReNeuS: scatter_add_) ---
                 contribution = h_weight[inside_sel] * vol_color
                 inside_pixels = h_pixel[inside_sel]
                 final_color.scatter_add_(
                     0, inside_pixels.unsqueeze(-1).expand(-1, 3), contribution
                 )
 
-                # [ReNeuS Eq.15] 累積 sub-ray transmittance loss
-                ret_trans_loss = ret_trans_loss + vol_weights_sum.mean()
+                # [ReNeuS Eq.15] Transmittance loss: 累加 ||1-T_ℓ|| (不取 mean，由 exp_runner 做 /|M_in|)
+                ret_trans_loss = ret_trans_loss + vol_weights_sum.sum()
 
                 # [ReNeuS Eq.11] Update throughput: T_new = T_old * (1 - opacity)
                 h_weight[inside_sel] = h_weight[inside_sel] * (1.0 - vol_weights_sum).clamp(0.0, 1.0)
 
-                # Store metrics from first volume render (for training diagnostics)
+                # --- Store metrics from first volume render ---
+                # NeuS: directly from ret_fine. ReNeuS: scatter to original pixels.
                 if not has_rendered_volume:
                     ret_gradient_error = ret_fine['gradient_error']
                     orig_pixels = inside_pixels
@@ -727,6 +740,7 @@ class NeuSRenderer:
                     if feat_n_samples >= self.n_samples:
                         ret_gradients[orig_pixels] = ret_fine['gradients'][:, :self.n_samples, :]
                         ret_weights[orig_pixels] = ret_fine['weights'][:, :self.n_samples]
+                        ret_inside_sphere[orig_pixels] = ret_fine['inside_sphere'][:, :self.n_samples]
 
                     has_rendered_volume = True
 
@@ -761,17 +775,16 @@ class NeuSRenderer:
             fresnel_R = torch.where(tir_mask, torch.ones_like(fresnel_R), fresnel_R)
             fresnel_T = 1.0 - fresnel_R
 
-            # --- Build next iteration's ray bundles ---
-            # Reflection branch: all rays reflect, weight *= R
+            # Reflection branch
             reflect_o = h_pts + 1e-4 * d_reflect
-            reflect_ior = ior1  # Stays in same medium
+            reflect_ior = ior1
 
             # Refraction branch: only non-TIR rays, weight *= T
             refract_valid = valid_refract
             refract_o = h_pts[refract_valid] + 1e-4 * d_refract[refract_valid]
-            refract_ior = ior2[refract_valid]  # Transitions to other medium
+            refract_ior = ior2[refract_valid]
 
-            # Concatenate both branches for next bounce
+            # Concatenate both branches
             next_pixel_idx = torch.cat([h_pixel, h_pixel[refract_valid]])
             next_o = torch.cat([reflect_o, refract_o])
             next_d = torch.cat([d_reflect, d_refract[refract_valid]])
@@ -788,16 +801,18 @@ class NeuSRenderer:
             curr_ior = next_ior
             curr_weight = next_weight
 
-        # ------------------------------------------------------------------
-        # End of Iterative Loop: assign background to remaining active rays
-        # ------------------------------------------------------------------
+        # =====================================================================
+        # End of loop: assign background to remaining active rays
+        # NeuS: background via NeRF++ or fixed color in render_core
+        # ReNeuS: fixed background C_out (Sec 4.3)
+        # =====================================================================
         if len(pixel_idx) > 0 and background_rgb is not None:
             bg_contrib = curr_weight * background_rgb
             final_color.scatter_add_(
                 0, pixel_idx.unsqueeze(-1).expand(-1, 3), bg_contrib
             )
 
-        # Ensure gradient flow even if no rays entered the container
+        # Gradient flow protection
         if not has_rendered_volume:
             dummy_sdf = self.sdf_network.sdf(rays_o[:1])
             final_color = final_color + dummy_sdf.sum() * 0.0
@@ -807,123 +822,21 @@ class NeuSRenderer:
         final_color = torch.clamp(final_color, 0.0, 1.0)
         final_color = torch.pow(final_color + 1e-8, 1.0 / 2.2)
 
+        # =====================================================================
+        # Pack & return (same keys as NeuS + trans_loss)
+        # =====================================================================
         return {
             'color_fine': final_color,
             's_val': ret_s_val,
             'cdf_fine': torch.zeros(batch_size, self.n_samples, device=device),
             'weight_sum': ret_weights_sum,
             'weight_max': ret_weights_sum,
-            'gradient_error': ret_gradient_error,
             'gradients': ret_gradients,
             'weights': ret_weights,
-            'trans_loss': ret_trans_loss,  # [ReNeuS Eq.15]
+            'gradient_error': ret_gradient_error,
+            'inside_sphere': ret_inside_sphere,
+            'trans_loss': ret_trans_loss,  # [ReNeuS Eq.15] (NeuS 無此項)
         }
-
-    def render(self, rays_o, rays_d, near, far, perturb_overwrite=-1, background_rgb=None, cos_anneal_ratio=0.0):
-        # [ReNeuS] 與 NeuS 原版差異：
-        # - NeuS: 直接做單次體渲染 + NeRF++ 背景
-        # - ReNeuS: 轉發到 render_with_refraction()，做多次彈跳光線追蹤
-        # NeuS 原版的渲染邏輯已保留在下方註解中供參考
-        if self.container_mesh is not None:
-            return self.render_with_refraction(
-                rays_o, rays_d, near, far, perturb_overwrite, background_rgb, cos_anneal_ratio
-            )
-        else:
-            raise ValueError("Container mesh is not loaded")
-        
-        # Original NeuS rendering (backward disabled)
-        # batch_size = len(rays_o)
-        # sample_dist = 2.0 / self.n_samples   # Assuming the region of interest is a unit sphere
-        # z_vals = torch.linspace(0.0, 1.0, self.n_samples)
-        # z_vals = near + (far - near) * z_vals[None, :]
-
-        # z_vals_outside = None
-        # if self.n_outside > 0:
-        #     z_vals_outside = torch.linspace(1e-3, 1.0 - 1.0 / (self.n_outside + 1.0), self.n_outside)
-
-        # n_samples = self.n_samples
-        # perturb = self.perturb
-
-        # if perturb_overwrite >= 0:
-        #     perturb = perturb_overwrite
-        # if perturb > 0:
-        #     t_rand = (torch.rand([batch_size, 1]) - 0.5)
-        #     z_vals = z_vals + t_rand * 2.0 / self.n_samples
-
-        #     if self.n_outside > 0:
-        #         mids = .5 * (z_vals_outside[..., 1:] + z_vals_outside[..., :-1])
-        #         upper = torch.cat([mids, z_vals_outside[..., -1:]], -1)
-        #         lower = torch.cat([z_vals_outside[..., :1], mids], -1)
-        #         t_rand = torch.rand([batch_size, z_vals_outside.shape[-1]])
-        #         z_vals_outside = lower[None, :] + (upper - lower)[None, :] * t_rand
-
-        # if self.n_outside > 0:
-        #     z_vals_outside = far / torch.flip(z_vals_outside, dims=[-1]) + 1.0 / self.n_samples
-
-        # background_alpha = None
-        # background_sampled_color = None
-
-        # # Up sample
-        # if self.n_importance > 0:
-        #     with torch.no_grad():
-        #         pts = rays_o[:, None, :] + rays_d[:, None, :] * z_vals[..., :, None]
-        #         sdf = self.sdf_network.sdf(pts.reshape(-1, 3)).reshape(batch_size, self.n_samples)
-
-        #         for i in range(self.up_sample_steps):
-        #             new_z_vals = self.up_sample(rays_o,
-        #                                         rays_d,
-        #                                         z_vals,
-        #                                         sdf,
-        #                                         self.n_importance // self.up_sample_steps,
-        #                                         64 * 2**i)
-        #             z_vals, sdf = self.cat_z_vals(rays_o,
-        #                                           rays_d,
-        #                                           z_vals,
-        #                                           new_z_vals,
-        #                                           sdf,
-        #                                           last=(i + 1 == self.up_sample_steps))
-
-        #     n_samples = self.n_samples + self.n_importance
-
-        # # Background model
-        # if self.n_outside > 0:
-        #     z_vals_feed = torch.cat([z_vals, z_vals_outside], dim=-1)
-        #     z_vals_feed, _ = torch.sort(z_vals_feed, dim=-1)
-        #     ret_outside = self.render_core_outside(rays_o, rays_d, z_vals_feed, sample_dist, self.nerf)
-
-        #     background_sampled_color = ret_outside['sampled_color']
-        #     background_alpha = ret_outside['alpha']
-
-        # # Render core
-        # ret_fine = self.render_core(rays_o,
-        #                             rays_d,
-        #                             z_vals,
-        #                             sample_dist,
-        #                             self.sdf_network,
-        #                             self.deviation_network,
-        #                             self.color_network,
-        #                             background_rgb=background_rgb,
-        #                             background_alpha=background_alpha,
-        #                             background_sampled_color=background_sampled_color,
-        #                             cos_anneal_ratio=cos_anneal_ratio)
-
-        # color_fine = ret_fine['color']
-        # weights = ret_fine['weights']
-        # weights_sum = weights.sum(dim=-1, keepdim=True)
-        # gradients = ret_fine['gradients']
-        # s_val = ret_fine['s_val'].reshape(batch_size, n_samples).mean(dim=-1, keepdim=True)
-
-        # return {
-        #     'color_fine': color_fine,
-        #     's_val': s_val,
-        #     'cdf_fine': ret_fine['cdf'],
-        #     'weight_sum': weights_sum,
-        #     'weight_max': torch.max(weights, dim=-1, keepdim=True)[0],
-        #     'gradients': gradients,
-        #     'weights': weights,
-        #     'gradient_error': ret_fine['gradient_error'],
-        #     'inside_sphere': ret_fine['inside_sphere']
-        # }
 
     def extract_geometry(self, bound_min, bound_max, resolution, threshold=0.0):
         return extract_geometry(bound_min,

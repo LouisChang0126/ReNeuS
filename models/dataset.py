@@ -48,12 +48,18 @@ class Dataset:
         self.camera_outside_sphere = conf.get_bool('camera_outside_sphere', default=True)
         self.scale_mat_scale = conf.get_float('scale_mat_scale', default=1.1)
 
+        # 可選子目錄，用於 lego_glass_wbg 這類把 train/test/val 分開存放的 dataset
+        image_subdir = conf.get_string('image_subdir', default='')
+        mask_subdir  = conf.get_string('mask_subdir',  default='')
+        image_dir = os.path.join(self.data_dir, 'image', image_subdir) if image_subdir else os.path.join(self.data_dir, 'image')
+        mask_dir  = os.path.join(self.data_dir, 'mask',  mask_subdir)  if mask_subdir  else os.path.join(self.data_dir, 'mask')
+
         camera_dict = np.load(os.path.join(self.data_dir, self.render_cameras_name))
         self.camera_dict = camera_dict
-        self.images_lis = sorted(glob(os.path.join(self.data_dir, 'image/*.png')))
+        self.images_lis = sorted(glob(os.path.join(image_dir, '*.png')))
         self.n_images = len(self.images_lis)
         self.images_np = np.stack([cv.imread(im_name) for im_name in self.images_lis]) / 256.0
-        self.masks_lis = sorted(glob(os.path.join(self.data_dir, 'mask/*.png')))
+        self.masks_lis = sorted(glob(os.path.join(mask_dir, '*.png')))
         self.masks_np = np.stack([cv.imread(im_name) for im_name in self.masks_lis]) / 256.0
 
         # world_mat is a projection matrix from world to image
