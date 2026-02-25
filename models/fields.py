@@ -33,7 +33,7 @@ class SineLayer(nn.Module):
     def forward(self, input):
         return torch.sin(self.omega_0 * self.linear(input))
 
-class SDFNetwork(nn.Module):
+class SDFNetwork(nn.Module): # MLP1 (yellow in teaser)
     def __init__(self,
                  d_in,
                  d_out,
@@ -139,7 +139,7 @@ class SDFNetwork(nn.Module):
 
 
 # This implementation is borrowed from IDR: https://github.com/lioryariv/idr
-class RenderingNetwork(nn.Module):
+class RenderingNetwork(nn.Module): # MLP2 (orange in teaser)
     def __init__(self,
                  d_feature,
                  mode,
