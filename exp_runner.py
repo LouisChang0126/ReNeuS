@@ -325,13 +325,63 @@ class Runner:
         os.makedirs(os.path.join(self.base_exp_dir, 'validations_fine'), exist_ok=True)
         os.makedirs(os.path.join(self.base_exp_dir, 'normals'), exist_ok=True)
 
+        # [ReNeuS] 投影 container mesh 邊線到 img_fine（中間那格），方便觀察 mesh 對齊
+        def draw_mesh_wireframe(img_bgr, mesh, intrinsics, w2c, res_level, color=(0, 200, 0), alpha=0.6):
+            """將 mesh 的 edges_unique 投影到圖像上，以半透明線條繪製。"""
+            if mesh is None:
+                return img_bgr
+            overlay = img_bgr.copy()
+            # 相機內參（縮放至 resolution_level）
+            K = intrinsics.detach().cpu().numpy().copy()
+            K[0] /= res_level   # fx, cx
+            K[1] /= res_level   # fy, cy
+            # w2c [4x4]
+            R = w2c[:3, :3].detach().cpu().numpy()
+            t = w2c[:3, 3].detach().cpu().numpy()
+            # mesh 頂點 (N, 3) → 投影到圖像
+            verts = np.array(mesh.vertices, dtype=np.float64)            # (N, 3) normalized space
+            verts_cam = (R @ verts.T).T + t[None, :]                    # (N, 3) camera space
+            # 過濾在相機前方的頂點
+            in_front = verts_cam[:, 2] > 1e-4
+            # 投影：u = fx*(X/Z) + cx, v = fy*(Y/Z) + cy
+            u = (K[0, 0] * verts_cam[:, 0] / np.where(verts_cam[:, 2] > 1e-8, verts_cam[:, 2], 1e-8)
+                 + K[0, 2]).astype(np.float32)
+            v = (K[1, 1] * verts_cam[:, 1] / np.where(verts_cam[:, 2] > 1e-8, verts_cam[:, 2], 1e-8)
+                 + K[1, 2]).astype(np.float32)
+            H_img, W_img = img_bgr.shape[:2]
+            edges = mesh.edges_unique   # (E, 2)
+            for e in edges:
+                i0, i1 = e
+                # 兩端點都要在相機前方
+                if not (in_front[i0] and in_front[i1]):
+                    continue
+                p0 = (int(round(u[i0])), int(round(v[i0])))
+                p1 = (int(round(u[i1])), int(round(v[i1])))
+                # 至少一端在圖像範圍內才畫
+                def in_img(p): return 0 <= p[0] < W_img and 0 <= p[1] < H_img
+                if not (in_img(p0) or in_img(p1)):
+                    continue
+                cv.line(overlay, p0, p1, color, 1, cv.LINE_AA)
+            return cv.addWeighted(overlay, alpha, img_bgr, 1 - alpha, 0)
+
         for i in range(img_fine.shape[-1]):
             if len(out_rgb_fine) > 0:
+                fine_panel = img_fine[..., i].copy()
+                # 在中間那格（img_fine）上畫 mesh 邊線
+                if (self.renderer.container_mesh is not None
+                        and hasattr(self.renderer.container_mesh, 'edges_unique')):
+                    fine_panel = draw_mesh_wireframe(
+                        fine_panel,
+                        self.renderer.container_mesh,
+                        self.dataset.intrinsics_all[idx],
+                        self.dataset.pose_all[idx],
+                        resolution_level
+                    )
                 cv.imwrite(os.path.join(self.base_exp_dir,
                                         'validations_fine',
                                         '{:0>8d}_{}_{}.png'.format(self.iter_step, i, idx)),
                            np.concatenate([img_internal[..., i],
-                                           img_fine[..., i],
+                                           fine_panel,
                                            self.dataset.image_at(idx, resolution_level=resolution_level)]))
             if len(out_normal_fine) > 0:
                 cv.imwrite(os.path.join(self.base_exp_dir,
