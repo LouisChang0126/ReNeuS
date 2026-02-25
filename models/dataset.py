@@ -254,7 +254,7 @@ class Dataset:
         # Camera origin: R^T @ (-t)
         t = self.pose_all[img_idx, :3, 3]
         rays_o = (R.T @ (-t)).expand(rays_v.shape)  # (B,3)
-        return torch.cat([rays_o, rays_v, color, mask[:, :1]], dim=-1)
+        return torch.cat([rays_o, rays_v, color, mask[:, 0:1]], dim=-1)
 
     def gen_rays_between(self, idx_0, idx_1, ratio, resolution_level=1):
         """Interpolate pose between two cameras (same OpenCV w2c convention)."""

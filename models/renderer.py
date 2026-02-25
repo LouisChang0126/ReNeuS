@@ -5,6 +5,7 @@ import numpy as np
 import logging
 import mcubes
 from icecream import ic
+from models.ray_mesh import GPURayMeshIntersector
 
 
 # ==============================================================================
@@ -14,7 +15,8 @@ from icecream import ic
 #   - compute_reflection(): 反射定律 (Eq.7)
 #   - compute_fresnel(): Fresnel 方程式, natural light assumption (Eq.8-9)
 #   - check_total_internal_reflection(): TIR 檢查
-#   - ray_mesh_intersection(): trimesh 的光線-容器交叉檢測
+#   - ray_mesh_intersection(): trimesh CPU 版 (fallback only)
+#   - GPURayMeshIntersector: 純 GPU Möller–Trumbore (主要使用)
 # ==============================================================================
 
 def compute_refraction(ray_d, normal, ior_in, ior_out):
@@ -340,7 +342,8 @@ class NeuSRenderer:
         self.ior = ior
         self.max_bounces = max_bounces
         self.container_mesh = None  # [ReNeuS] NeuS 原版無容器 mesh
-        self.ray_tracer = None  # [ReNeuS] trimesh ray tracer 實例
+        self.gpu_intersector = None  # [ReNeuS] GPU Möller–Trumbore intersector（主要）
+        self.ray_tracer = None  # [ReNeuS] trimesh CPU ray tracer（fallback）
         self.scale_mat = scale_mat  # [ReNeuS] for mesh normalization
         
         if container_mesh_path is not None:
@@ -354,23 +357,37 @@ class NeuSRenderer:
                     scale_mat_inv = np.linalg.inv(self.scale_mat)
                     self.container_mesh.apply_transform(scale_mat_inv)
                     logging.info('[ReNeuS] Applied scale_mat_inv to container_mesh (world -> norm)')
-                
-                # Initialize ray tracer with Embree acceleration (requires pyembree)
+
+                # [ReNeuS] 優先使用純 GPU Möller–Trumbore intersector（無 CPU-GPU 搬移開銷）
+                # Fallback: trimesh CPU ray tracer（OOM 或其他錯誤時使用）
                 try:
-                    self.ray_tracer = trimesh.ray.ray_pyembree.RayMeshIntersector(
-                        self.container_mesh
+                    self.gpu_intersector = GPURayMeshIntersector(
+                        self.container_mesh, device='cuda'
                     )
-                    logging.info('[ReNeuS] Using Embree ray tracer (accelerated)')
-                except:
-                    logging.warning('[ReNeuS] Embree not available, using default ray tracer (slower)')
-                    self.ray_tracer = trimesh.ray.ray_triangle.RayMeshIntersector(
-                        self.container_mesh
+                    self.ray_tracer = None  # GPU 版本不需要 CPU ray_tracer
+                    logging.info(
+                        f'[ReNeuS] Using GPU ray intersector (Möller–Trumbore), '
+                        f'{self.container_mesh.faces.shape[0]} faces, IOR={self.ior}'
                     )
-                
+                except Exception as gpu_e:
+                    logging.warning(f'[ReNeuS] GPU intersector failed ({gpu_e}), falling back to trimesh CPU')
+                    self.gpu_intersector = None
+                    try:
+                        self.ray_tracer = trimesh.ray.ray_pyembree.RayMeshIntersector(
+                            self.container_mesh
+                        )
+                        logging.info('[ReNeuS] Fallback: Embree CPU ray tracer')
+                    except:
+                        self.ray_tracer = trimesh.ray.ray_triangle.RayMeshIntersector(
+                            self.container_mesh
+                        )
+                        logging.warning('[ReNeuS] Fallback: default trimesh CPU ray tracer (slow)')
+
                 logging.info(f'[ReNeuS] Container mesh loaded: {self.container_mesh.faces.shape[0]} faces, IOR={self.ior}')
             except Exception as e:
                 logging.error(f'[ReNeuS] Failed to load container mesh: {e}')
                 self.container_mesh = None
+                self.gpu_intersector = None
                 self.ray_tracer = None
 
 
@@ -670,9 +687,14 @@ class NeuSRenderer:
                 break
 
             # ----- Step 1: Intersect with Container Mesh -----
-            hit_mask, hit_points, hit_normals, hit_distances = ray_mesh_intersection(
-                curr_o, curr_d, self.ray_tracer
-            )
+            # [ReNeuS] 優先使用 GPU Möller–Trumbore；fallback 到 trimesh CPU
+            if self.gpu_intersector is not None:
+                hit_mask, hit_points, hit_normals, hit_distances = \
+                    self.gpu_intersector.intersect_batch(curr_o, curr_d)
+            else:
+                hit_mask, hit_points, hit_normals, hit_distances = ray_mesh_intersection(
+                    curr_o, curr_d, self.ray_tracer
+                )
 
             # ----- Step 2: Handle Misses → background -----
             miss_mask = ~hit_mask
