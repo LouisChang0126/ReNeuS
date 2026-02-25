@@ -6,34 +6,7 @@ from models.embedder import get_embedder
 
 
 # This implementation is borrowed from IDR: https://github.com/lioryariv/idr
-
-# =============================================================================
-# [ReNeuS] SIREN Activation (論文 Sec 4.3, [28])
-# NeuS 原版使用 Softplus(beta=100) 作為激活函數。
-# ReNeuS 將其替換為 SIREN (Sinusoidal Representation Networks) 的週期激活函數，
-# 因為 SIREN 對神經隱式表示有更強的描述能力。
-# =============================================================================
-class SineLayer(nn.Module):
-    def __init__(self, in_features, out_features, bias=True, is_first=False, omega_0=30):
-        super().__init__()
-        self.omega_0 = omega_0
-        self.is_first = is_first
-        self.in_features = in_features
-        self.linear = nn.Linear(in_features, out_features, bias=bias)
-        self.init_weights()
-
-    def init_weights(self):
-        with torch.no_grad():
-            if self.is_first:
-                self.linear.weight.uniform_(-1 / self.in_features, 1 / self.in_features)
-            else:
-                self.linear.weight.uniform_(-np.sqrt(6 / self.in_features) / self.omega_0, 
-                                            np.sqrt(6 / self.in_features) / self.omega_0)
-
-    def forward(self, input):
-        return torch.sin(self.omega_0 * self.linear(input))
-
-class SDFNetwork(nn.Module): # MLP1 (yellow in teaser)
+class SDFNetwork(nn.Module):
     def __init__(self,
                  d_in,
                  d_out,
@@ -48,11 +21,6 @@ class SDFNetwork(nn.Module): # MLP1 (yellow in teaser)
                  inside_outside=False):
         super(SDFNetwork, self).__init__()
 
-        # [ReNeuS] SIREN 改造說明 (vs NeuS 原版):
-        # - NeuS: 所有隱藏層使用 nn.Linear + Softplus(beta=100)
-        # - ReNeuS: 隱藏層使用 SineLayer (sin(ω₀·Wx+b))，最後一層保持 nn.Linear
-        # - NeuS 的 geometric init 對隱藏層有特殊初始化，ReNeuS 用 SIREN 自帶的初始化
-        # - NeuS 有 sdf_hidden_appearance() 方法，ReNeuS 不需要（已移除）
         dims = [d_in] + [d_hidden for _ in range(n_layers)] + [d_out]
 
         self.embed_fn_fine = None
@@ -72,40 +40,35 @@ class SDFNetwork(nn.Module): # MLP1 (yellow in teaser)
             else:
                 out_dim = dims[l + 1]
 
-            # [ReNeuS] 只對非最後一層使用 SIREN 激活
-            # NeuS 原版：所有層用 nn.Linear，forward 時手動呼叫 self.activation(x)
-            # ReNeuS：隱藏層改用 SineLayer (內建 sin 激活)，最後一層保持 nn.Linear
-            if l < self.num_layers - 2:
-                # [ReNeuS] 隱藏層：使用 SineLayer (sin(ω₀·Wx+b))
-                if l == 0:
-                    layer = SineLayer(dims[l], out_dim, is_first=True, omega_0=30.0)
-                else:
-                    layer = SineLayer(dims[l], out_dim, is_first=False, omega_0=30.0)
-                
-                if weight_norm:
-                    layer.linear = nn.utils.weight_norm(layer.linear)
-            else:
-                # 最後一層：普通 Linear，用於輸出 SDF
-                layer = nn.Linear(dims[l], out_dim)
-                
-                # 應用 geometric initialization (sphere bias)
-                if geometric_init:
+            lin = nn.Linear(dims[l], out_dim)
+
+            if geometric_init:
+                if l == self.num_layers - 2:
                     if not inside_outside:
-                        torch.nn.init.normal_(layer.weight, mean=np.sqrt(np.pi) / np.sqrt(dims[l]), std=0.0001)
-                        torch.nn.init.constant_(layer.bias, -bias)
+                        torch.nn.init.normal_(lin.weight, mean=np.sqrt(np.pi) / np.sqrt(dims[l]), std=0.0001)
+                        torch.nn.init.constant_(lin.bias, -bias)
                     else:
-                        torch.nn.init.normal_(layer.weight, mean=-np.sqrt(np.pi) / np.sqrt(dims[l]), std=0.0001)
-                        torch.nn.init.constant_(layer.bias, bias)
-                
-                if weight_norm:
-                    layer = nn.utils.weight_norm(layer)
+                        torch.nn.init.normal_(lin.weight, mean=-np.sqrt(np.pi) / np.sqrt(dims[l]), std=0.0001)
+                        torch.nn.init.constant_(lin.bias, bias)
+                elif multires > 0 and l == 0:
+                    torch.nn.init.constant_(lin.bias, 0.0)
+                    torch.nn.init.constant_(lin.weight[:, 3:], 0.0)
+                    torch.nn.init.normal_(lin.weight[:, :3], 0.0, np.sqrt(2) / np.sqrt(out_dim))
+                elif multires > 0 and l in self.skip_in:
+                    torch.nn.init.constant_(lin.bias, 0.0)
+                    torch.nn.init.normal_(lin.weight, 0.0, np.sqrt(2) / np.sqrt(out_dim))
+                    torch.nn.init.constant_(lin.weight[:, -(dims[0] - 3):], 0.0)
+                else:
+                    torch.nn.init.constant_(lin.bias, 0.0)
+                    torch.nn.init.normal_(lin.weight, 0.0, np.sqrt(2) / np.sqrt(out_dim))
 
-            setattr(self, "lin" + str(l), layer)
+            if weight_norm:
+                lin = nn.utils.weight_norm(lin)
 
-    # [ReNeuS] forward 與 NeuS 原版差異：
-    # - NeuS: 每層後手動呼叫 self.activation = nn.Softplus(beta=100)
-    # - ReNeuS: SineLayer 內建激活 (sin)，forward 中不需要額外呼叫 activation
-    # - NeuS: 有 sdf_hidden_appearance(x) 方法返回中間表示，ReNeuS 已移除
+            setattr(self, "lin" + str(l), lin)
+
+        self.activation = nn.Softplus(beta=100)
+
     def forward(self, inputs):
         inputs = inputs * self.scale
         if self.embed_fn_fine is not None:
@@ -119,10 +82,16 @@ class SDFNetwork(nn.Module): # MLP1 (yellow in teaser)
                 x = torch.cat([x, inputs], 1) / np.sqrt(2)
 
             x = lin(x)
+
+            if l < self.num_layers - 2:
+                x = self.activation(x)
         return torch.cat([x[:, :1] / self.scale, x[:, 1:]], dim=-1)
 
     def sdf(self, x):
         return self.forward(x)[:, :1]
+
+    def sdf_hidden_appearance(self, x):
+        return self.forward(x)
 
     def gradient(self, x):
         x.requires_grad_(True)
@@ -139,7 +108,7 @@ class SDFNetwork(nn.Module): # MLP1 (yellow in teaser)
 
 
 # This implementation is borrowed from IDR: https://github.com/lioryariv/idr
-class RenderingNetwork(nn.Module): # MLP2 (orange in teaser)
+class RenderingNetwork(nn.Module):
     def __init__(self,
                  d_feature,
                  mode,

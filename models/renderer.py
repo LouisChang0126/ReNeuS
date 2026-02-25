@@ -604,17 +604,17 @@ class NeuSRenderer:
 
         inner_color_fine = None
         if extract_inner_render:
-            with torch.no_grad():
-                # Bypass container intersection and render SDF network directly
-                z_vals_in = torch.linspace(0.0, 1.0, self.n_samples, device=device)
-                z_vals_in = near + (far - near) * z_vals_in[None, :]
+            # Bypass container intersection and render SDF network directly
+            z_vals_in = torch.linspace(0.0, 1.0, self.n_samples, device=device)
+            z_vals_in = near + (far - near) * z_vals_in[None, :]
 
-                perturb_in = self.perturb if perturb_overwrite < 0 else perturb_overwrite
-                if perturb_in > 0:
-                    t_rand_in = (torch.rand([batch_size, 1], device=device) - 0.5)
-                    z_vals_in = z_vals_in + t_rand_in * (far - near) / self.n_samples
+            perturb_in = self.perturb if perturb_overwrite < 0 else perturb_overwrite
+            if perturb_in > 0:
+                t_rand_in = (torch.rand([batch_size, 1], device=device) - 0.5)
+                z_vals_in = z_vals_in + t_rand_in * (far - near) / self.n_samples
 
-                if self.n_importance > 0:
+            if self.n_importance > 0:
+                with torch.no_grad():
                     pts_in = rays_o[:, None, :] + rays_d[:, None, :] * z_vals_in[..., :, None]
                     sdf_in = self.sdf_network.sdf(pts_in.reshape(-1, 3)).reshape(batch_size, self.n_samples)
 
@@ -625,15 +625,15 @@ class NeuSRenderer:
                                                       last=(i + 1 == self.up_sample_steps))
 
                 sample_dist_in = ((far - near) / self.n_samples).mean().item()
-                ret_in = self.render_core(
-                    rays_o, rays_d, z_vals_in, sample_dist_in,
-                    self.sdf_network, self.deviation_network, self.color_network,
-                    background_rgb=background_rgb,
-                    cos_anneal_ratio=cos_anneal_ratio
-                )
+            ret_in = self.render_core(
+                rays_o, rays_d, z_vals_in, sample_dist_in,
+                self.sdf_network, self.deviation_network, self.color_network,
+                background_rgb=background_rgb,
+                cos_anneal_ratio=cos_anneal_ratio
+            )
 
-                inner_color_fine = torch.clamp(ret_in['color'], 0.0, 1.0)
-                inner_color_fine = torch.pow(inner_color_fine + 1e-8, 1.0 / 2.2)
+            inner_color_fine = torch.clamp(ret_in['color'], 0.0, 1.0)
+            inner_color_fine = torch.pow(inner_color_fine + 1e-8, 1.0 / 2.2)
 
         # =====================================================================
         # Output accumulators (fixed size, indexed by original pixel)
