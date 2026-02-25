@@ -560,7 +560,7 @@ class NeuSRenderer:
             'inside_sphere': inside_sphere
         }
 
-    def render(self, rays_o, rays_d, near, far, perturb_overwrite=-1, background_rgb=None, cos_anneal_ratio=0.0):
+    def render(self, rays_o, rays_d, near, far, perturb_overwrite=-1, background_rgb=None, cos_anneal_ratio=0.0, extract_inner_render=False):
         """
         [ReNeuS] Deterministic Branching 渲染 (論文 Sec 3.3, Eq.7-12)
 
@@ -601,6 +601,39 @@ class NeuSRenderer:
         """
         device = rays_o.device
         batch_size = len(rays_o)
+
+        inner_color_fine = None
+        if extract_inner_render:
+            with torch.no_grad():
+                # Bypass container intersection and render SDF network directly
+                z_vals_in = torch.linspace(0.0, 1.0, self.n_samples, device=device)
+                z_vals_in = near + (far - near) * z_vals_in[None, :]
+
+                perturb_in = self.perturb if perturb_overwrite < 0 else perturb_overwrite
+                if perturb_in > 0:
+                    t_rand_in = (torch.rand([batch_size, 1], device=device) - 0.5)
+                    z_vals_in = z_vals_in + t_rand_in * (far - near) / self.n_samples
+
+                if self.n_importance > 0:
+                    pts_in = rays_o[:, None, :] + rays_d[:, None, :] * z_vals_in[..., :, None]
+                    sdf_in = self.sdf_network.sdf(pts_in.reshape(-1, 3)).reshape(batch_size, self.n_samples)
+
+                    for i in range(self.up_sample_steps):
+                        new_z_vals_in = self.up_sample(rays_o, rays_d, z_vals_in, sdf_in,
+                                                    self.n_importance // self.up_sample_steps, 64 * 2**i)
+                        z_vals_in, sdf_in = self.cat_z_vals(rays_o, rays_d, z_vals_in, new_z_vals_in, sdf_in,
+                                                      last=(i + 1 == self.up_sample_steps))
+
+                sample_dist_in = ((far - near) / self.n_samples).mean().item()
+                ret_in = self.render_core(
+                    rays_o, rays_d, z_vals_in, sample_dist_in,
+                    self.sdf_network, self.deviation_network, self.color_network,
+                    background_rgb=background_rgb,
+                    cos_anneal_ratio=cos_anneal_ratio
+                )
+
+                inner_color_fine = torch.clamp(ret_in['color'], 0.0, 1.0)
+                inner_color_fine = torch.pow(inner_color_fine + 1e-8, 1.0 / 2.2)
 
         # =====================================================================
         # Output accumulators (fixed size, indexed by original pixel)
@@ -829,7 +862,7 @@ class NeuSRenderer:
         # =====================================================================
         # Pack & return (same keys as NeuS + trans_loss)
         # =====================================================================
-        return {
+        ret_dict = {
             'color_fine': final_color,
             's_val': ret_s_val,
             'cdf_fine': torch.zeros(batch_size, self.n_samples, device=device),
@@ -841,6 +874,11 @@ class NeuSRenderer:
             'inside_sphere': ret_inside_sphere,
             'trans_loss': ret_trans_loss,  # [ReNeuS Eq.15] (NeuS 無此項)
         }
+        
+        if inner_color_fine is not None:
+            ret_dict['inner_color_fine'] = inner_color_fine
+            
+        return ret_dict
 
     def extract_geometry(self, bound_min, bound_max, resolution, threshold=0.0):
         return extract_geometry(bound_min,

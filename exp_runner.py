@@ -277,6 +277,7 @@ class Runner:
         rays_d = rays_d.reshape(-1, 3).split(self.batch_size)
 
         out_rgb_fine = []
+        out_rgb_internal = []
         out_normal_fine = []
 
         for rays_o_batch, rays_d_batch in zip(rays_o, rays_d):
@@ -288,12 +289,15 @@ class Runner:
                                               near,
                                               far,
                                               cos_anneal_ratio=self.get_cos_anneal_ratio(),
-                                              background_rgb=background_rgb)
+                                              background_rgb=background_rgb,
+                                              extract_inner_render=True)
 
             def feasible(key): return (key in render_out) and (render_out[key] is not None)
 
             if feasible('color_fine'):
                 out_rgb_fine.append(render_out['color_fine'].detach().cpu().numpy())
+            if feasible('inner_color_fine'):
+                out_rgb_internal.append(render_out['inner_color_fine'].detach().cpu().numpy())
             if feasible('gradients') and feasible('weights'):
                 # ret_gradients/ret_weights 維度為 [batch, n_samples]（coarse only）
                 # n_samples = self.renderer.n_samples + self.renderer.n_importance
@@ -306,8 +310,10 @@ class Runner:
             del render_out
 
         img_fine = None
+        img_internal = None
         if len(out_rgb_fine) > 0:
             img_fine = (np.concatenate(out_rgb_fine, axis=0).reshape([H, W, 3, -1]) * 256).clip(0, 255)
+            img_internal = (np.concatenate(out_rgb_internal, axis=0).reshape([H, W, 3, -1]) * 256).clip(0, 255)
 
         normal_img = None
         if len(out_normal_fine) > 0:
@@ -324,7 +330,8 @@ class Runner:
                 cv.imwrite(os.path.join(self.base_exp_dir,
                                         'validations_fine',
                                         '{:0>8d}_{}_{}.png'.format(self.iter_step, i, idx)),
-                           np.concatenate([img_fine[..., i],
+                           np.concatenate([img_internal[..., i],
+                                           img_fine[..., i],
                                            self.dataset.image_at(idx, resolution_level=resolution_level)]))
             if len(out_normal_fine) > 0:
                 cv.imwrite(os.path.join(self.base_exp_dir,
