@@ -117,14 +117,25 @@ class Dataset:
         poses_list  = []
 
         for frame in frames:
-            # ---- pose (c2w) in NeRF/OpenGL convention → convert to OpenCV w2c ----
-            # NeRF JSON c2w: [right, up, back] (OpenGL)
-            # NeuS ray generation expects [right, down, front] (OpenCV)
-            # visualize_alignment.py: w2c_opencv = diag([1,-1,-1,1]) @ inv(c2w_nerf)
+            # ---- pose: NeRF/OpenGL c2w → Normalized Space OpenCV w2c ----
+            # Step 1: OpenGL c2w → OpenCV w2c (flip Y & Z)
             c2w_nerf = np.array(frame['transform_matrix'], dtype=np.float32)
             flip     = np.diag([1., -1., -1., 1.]).astype(np.float32)
-            w2c_cv   = flip @ np.linalg.inv(c2w_nerf)   # OpenCV world-to-camera
-            poses_list.append(w2c_cv)
+            w2c_cv   = flip @ np.linalg.inv(c2w_nerf)  # world-to-camera (OpenCV)
+
+            # Step 2: Fold scale_mat into projection → RQ decompose → normalized pose
+            # P_norm = K @ w2c_cv @ scale_mat  maps normalized coords → image
+            # cv.decomposeProjectionMatrix recovers (K_new, R_w2c, cam_center)
+            P_norm = (K @ w2c_cv @ scale_mat)[:3, :4]
+            _, R_dec, t_dec = cv.decomposeProjectionMatrix(P_norm)[:3]
+            cam_center = (t_dec[:3] / t_dec[3])[:, 0]  # camera position in norm space
+
+            c2w_norm = np.eye(4, dtype=np.float32)
+            c2w_norm[:3, :3] = R_dec.T            # R_dec is w2c rotation
+            c2w_norm[:3, 3]  = cam_center
+            w2c_norm = np.linalg.inv(c2w_norm).astype(np.float32)
+
+            poses_list.append(w2c_norm)
 
             # ---- image path ---------------------------------------------------
             fp = frame['file_path']
@@ -178,24 +189,13 @@ class Dataset:
         self.intrinsics_all_inv = torch.inverse(self.intrinsics_all)
         self.focal = self.intrinsics_all[0][0, 0]
 
-        # pose_all: OpenCV world-to-camera (w2c), (N,4,4) on CUDA
-        # Ray origin:    rays_o = w2c[:3,:3].T @ (-w2c[:3,3])  = c2w[:3,3]  (camera position)
-        # Ray direction: rays_v = c2w[:3,:3] @ K_inv[:3,:3] @ pixel          (OpenCV forward=+z)
+        # pose_all: Normalized-Space OpenCV w2c, (N,4,4) on CUDA
+        # scale_mat has been folded in: rays are in [-1,1]^3 centred at origin.
         self.pose_all = torch.from_numpy(poses_np).float().to(self.device)  # (N,4,4)
 
-        # ── Object bounding box (in normalized space, matching NeuS convention) ─
-        # In NeuS normalized space, the object fits within [-1,1]^3
-        # We use the same ±1.01 defaults, adapted via scale_mat
-        object_bbox_min = np.array([-1.01, -1.01, -1.01, 1.0])
-        object_bbox_max = np.array([ 1.01,  1.01,  1.01, 1.0])
-        # transform from normalized space → world space (scale_mat @ bbox_norm)
-        # then back to the "first camera's normalized" space (same scale_mat since shared)
-        # → bbox_world = scale_mat @ bbox_norm
-        bbox_min_w = (scale_mat @ object_bbox_min[:, None])[:3, 0]
-        bbox_max_w = (scale_mat @ object_bbox_max[:, None])[:3, 0]
-        # Re-express in the renderer's normalized space: inv(scale_mat) @ bbox_world = bbox_norm
-        self.object_bbox_min = (scale_mat_inv @ np.append(bbox_min_w, 1))[:3]
-        self.object_bbox_max = (scale_mat_inv @ np.append(bbox_max_w, 1))[:3]
+        # Object bounding box — already in normalized space (unit cube)
+        self.object_bbox_min = np.array([-1.01, -1.01, -1.01])
+        self.object_bbox_max = np.array([ 1.01,  1.01,  1.01])
 
         # Keep scale_mats_np list for near_far_from_sphere / any legacy code
         self.scale_mats_np = [scale_mat] * self.n_images

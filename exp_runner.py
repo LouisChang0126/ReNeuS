@@ -87,6 +87,7 @@ class Runner:
             ior = self.conf.get_float('model.reneus.ior')
 
         # [ReNeuS] 與 NeuS 原版差異：傳入額外的容器/折射參數
+        # scale_mat: 用於將 container_mesh 從 World Space 轉到 Normalized Space
         self.renderer = NeuSRenderer(self.nerf_outside,
                                      self.sdf_network,
                                      self.deviation_network,
@@ -94,7 +95,8 @@ class Runner:
                                      **self.conf['model.neus_renderer'],
                                      container_mesh_path=container_mesh_path,  # [ReNeuS] 新增
                                      ior=ior,                                  # [ReNeuS] 新增
-                                     max_bounces=max_bounces)                  # [ReNeuS] 新增
+                                     max_bounces=max_bounces,                  # [ReNeuS] 新增
+                                     scale_mat=self.dataset.scale_mat)         # [ReNeuS] 新增
 
 
         # Load checkpoint

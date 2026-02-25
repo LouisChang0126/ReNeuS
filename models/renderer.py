@@ -322,7 +322,8 @@ class NeuSRenderer:
                  perturb,
                  container_mesh_path=None,
                  ior=1.5,
-                 max_bounces=3):
+                 max_bounces=3,
+                 scale_mat=None):
         self.nerf = nerf
         self.sdf_network = sdf_network
         self.deviation_network = deviation_network
@@ -340,12 +341,19 @@ class NeuSRenderer:
         self.max_bounces = max_bounces
         self.container_mesh = None  # [ReNeuS] NeuS 原版無容器 mesh
         self.ray_tracer = None  # [ReNeuS] trimesh ray tracer 實例
+        self.scale_mat = scale_mat  # [ReNeuS] for mesh normalization
         
         if container_mesh_path is not None:
             try:
                 import trimesh
                 logging.info(f'[ReNeuS] Loading container mesh from: {container_mesh_path}')
                 self.container_mesh = trimesh.load(container_mesh_path, force='mesh')
+                
+                # Apply scale_mat inversion to align mesh with Normalized Space
+                if self.scale_mat is not None:
+                    scale_mat_inv = np.linalg.inv(self.scale_mat)
+                    self.container_mesh.apply_transform(scale_mat_inv)
+                    logging.info('[ReNeuS] Applied scale_mat_inv to container_mesh (world -> norm)')
                 
                 # Initialize ray tracer with Embree acceleration (requires pyembree)
                 try:
