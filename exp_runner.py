@@ -46,6 +46,7 @@ class Runner:
         self.learning_rate = self.conf.get_float('train.learning_rate')
         self.learning_rate_alpha = self.conf.get_float('train.learning_rate_alpha')
         self.use_white_bkgd = self.conf.get_bool('train.use_white_bkgd')
+        self.show_mesh_wireframe = self.conf.get_bool('train.show_mesh_wireframe', default=False)
         self.warm_up_end = self.conf.get_float('train.warm_up_end', default=0.0)
         self.anneal_end = self.conf.get_float('train.anneal_end', default=0.0)
 
@@ -373,7 +374,8 @@ class Runner:
             if len(out_rgb_fine) > 0:
                 fine_panel = img_fine[..., i].copy()
                 # 在中間那格（img_fine）上畫 mesh 邊線
-                if (self.renderer.container_mesh is not None
+                if (self.show_mesh_wireframe
+                        and self.renderer.container_mesh is not None
                         and hasattr(self.renderer.container_mesh, 'edges_unique')):
                     fine_panel = draw_mesh_wireframe(
                         fine_panel,

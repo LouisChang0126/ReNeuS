@@ -623,36 +623,103 @@ class NeuSRenderer:
 
         inner_color_fine = None
         if extract_inner_render:
-            # Bypass container intersection and render SDF network directly
-            z_vals_in = torch.linspace(0.0, 1.0, self.n_samples, device=device)
-            z_vals_in = near + (far - near) * z_vals_in[None, :]
+            # [ReNeuS] 直接渲染內部物體（去除玻璃容器的影響）
+            # 關鍵：只在容器 mesh 內部採樣，避免容器外 phantom surface
+            #
+            # 策略：用 ray-mesh intersection 找每條光線與容器的 entry/exit 點，
+            # 然後只在 [entry, exit] 範圍做 volume rendering。
+            # 對於未打到容器的光線，使用背景色。
 
-            perturb_in = self.perturb if perturb_overwrite < 0 else perturb_overwrite
-            if perturb_in > 0:
-                t_rand_in = (torch.rand([batch_size, 1], device=device) - 0.5)
-                z_vals_in = z_vals_in + t_rand_in * (far - near) / self.n_samples
+            # --- 決定每條光線的容器內部採樣範圍 ---
+            if self.gpu_intersector is not None or self.ray_tracer is not None:
+                # 求所有光線與容器的交點
+                if self.gpu_intersector is not None:
+                    hit_mask_in, hit_pts_in, _, hit_dist_in = \
+                        self.gpu_intersector.intersect_batch(rays_o, rays_d)
+                else:
+                    hit_mask_in, hit_pts_in, _, hit_dist_in = ray_mesh_intersection(
+                        rays_o, rays_d, self.ray_tracer
+                    )
 
-            if self.n_importance > 0:
-                with torch.no_grad():
-                    pts_in = rays_o[:, None, :] + rays_d[:, None, :] * z_vals_in[..., :, None]
-                    sdf_in = self.sdf_network.sdf(pts_in.reshape(-1, 3)).reshape(batch_size, self.n_samples)
+                # 對於 hit 的光線，需要找到第二個交點（exit 點）
+                # 稍微偏移 entry 點，再射一次找 exit
+                inner_near = torch.zeros(batch_size, 1, device=device)
+                inner_far  = torch.zeros(batch_size, 1, device=device)
+                valid_inner = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
-                    for i in range(self.up_sample_steps):
-                        new_z_vals_in = self.up_sample(rays_o, rays_d, z_vals_in, sdf_in,
-                                                    self.n_importance // self.up_sample_steps, 64 * 2**i)
-                        z_vals_in, sdf_in = self.cat_z_vals(rays_o, rays_d, z_vals_in, new_z_vals_in, sdf_in,
-                                                      last=(i + 1 == self.up_sample_steps))
+                if hit_mask_in.any():
+                    entry_pts = hit_pts_in[hit_mask_in]
+                    entry_dist = hit_dist_in[hit_mask_in]
+                    entry_dirs = rays_d[hit_mask_in]
 
-                sample_dist_in = ((far - near) / self.n_samples).mean().item()
-            ret_in = self.render_core(
-                rays_o, rays_d, z_vals_in, sample_dist_in,
-                self.sdf_network, self.deviation_network, self.color_network,
-                background_rgb=background_rgb,
-                cos_anneal_ratio=cos_anneal_ratio
-            )
+                    # 從 entry 點稍微偏移進入容器內部，再射一次找 exit
+                    nudged_o = entry_pts + 1e-4 * entry_dirs
+                    if self.gpu_intersector is not None:
+                        exit_mask, _, _, exit_dist = \
+                            self.gpu_intersector.intersect_batch(nudged_o, entry_dirs)
+                    else:
+                        exit_mask, _, _, exit_dist = ray_mesh_intersection(
+                            nudged_o, entry_dirs, self.ray_tracer
+                        )
 
-            inner_color_fine = torch.clamp(ret_in['color'], 0.0, 1.0)
-            inner_color_fine = torch.pow(inner_color_fine + 1e-8, 1.0 / 2.2)
+                    # 有找到 exit 的光線：near = entry_dist, far = entry_dist + exit_dist
+                    hit_indices = torch.where(hit_mask_in)[0]
+                    both_hit = exit_mask  # 同時有 entry 和 exit 的光線
+                    valid_indices = hit_indices[both_hit]
+
+                    inner_near[valid_indices] = entry_dist[both_hit].unsqueeze(-1) + 1e-4
+                    inner_far[valid_indices]  = entry_dist[both_hit].unsqueeze(-1) + exit_dist[both_hit].unsqueeze(-1)
+                    valid_inner[valid_indices] = True
+            else:
+                # 沒有容器 mesh，fallback 到 near/far
+                inner_near = near
+                inner_far  = far
+                valid_inner = torch.ones(batch_size, dtype=torch.bool, device=device)
+
+            # --- 初始化 inner color 為背景色 ---
+            if background_rgb is not None:
+                inner_color_fine = background_rgb.expand(batch_size, -1).clone()
+            else:
+                inner_color_fine = torch.zeros(batch_size, 3, device=device)
+
+            # --- 只對 valid 光線做 volume rendering ---
+            if valid_inner.any():
+                rays_o_valid = rays_o[valid_inner]
+                rays_d_valid = rays_d[valid_inner]
+                near_valid   = inner_near[valid_inner]
+                far_valid    = inner_far[valid_inner]
+                batch_valid  = rays_o_valid.shape[0]
+
+                z_vals_in = torch.linspace(0.0, 1.0, self.n_samples, device=device)
+                z_vals_in = near_valid + (far_valid - near_valid) * z_vals_in[None, :]
+
+                perturb_in = self.perturb if perturb_overwrite < 0 else perturb_overwrite
+                if perturb_in > 0:
+                    t_rand_in = (torch.rand([batch_valid, 1], device=device) - 0.5)
+                    z_vals_in = z_vals_in + t_rand_in * (far_valid - near_valid) / self.n_samples
+
+                if self.n_importance > 0:
+                    with torch.no_grad():
+                        pts_in = rays_o_valid[:, None, :] + rays_d_valid[:, None, :] * z_vals_in[..., :, None]
+                        sdf_in = self.sdf_network.sdf(pts_in.reshape(-1, 3)).reshape(batch_valid, self.n_samples)
+
+                        for i in range(self.up_sample_steps):
+                            new_z_vals_in = self.up_sample(rays_o_valid, rays_d_valid, z_vals_in, sdf_in,
+                                                        self.n_importance // self.up_sample_steps, 64 * 2**i)
+                            z_vals_in, sdf_in = self.cat_z_vals(rays_o_valid, rays_d_valid, z_vals_in, new_z_vals_in, sdf_in,
+                                                          last=(i + 1 == self.up_sample_steps))
+
+                    sample_dist_in = ((far_valid - near_valid) / self.n_samples).mean().item()
+
+                ret_in = self.render_core(
+                    rays_o_valid, rays_d_valid, z_vals_in, sample_dist_in,
+                    self.sdf_network, self.deviation_network, self.color_network,
+                    background_rgb=background_rgb,
+                    cos_anneal_ratio=cos_anneal_ratio
+                )
+
+                inner_color_fine[valid_inner] = torch.clamp(ret_in['color'], 0.0, 1.0)
+                # inner_color_fine = torch.pow(inner_color_fine + 1e-8, 1.0 / 2.2) # gamma correction
 
         # =====================================================================
         # Output accumulators (fixed size, indexed by original pixel)
