@@ -325,7 +325,8 @@ class NeuSRenderer:
                  container_mesh_path=None,
                  ior=1.5,
                  max_bounces=3,
-                 scale_mat=None):
+                 scale_mat=None,
+                 enable_reflection=True):
         self.nerf = nerf
         self.sdf_network = sdf_network
         self.deviation_network = deviation_network
@@ -341,6 +342,7 @@ class NeuSRenderer:
         # - max_bounces: 遞迴深度 Dre (論文 Sec 3.3, 實驗用 2)
         self.ior = ior
         self.max_bounces = max_bounces
+        self.enable_reflection = enable_reflection  # [ReNeuS] False 則只走折射，跳過反射分支
         self.container_mesh = None  # [ReNeuS] NeuS 原版無容器 mesh
         self.gpu_intersector = None  # [ReNeuS] GPU Möller–Trumbore intersector（主要）
         self.ray_tracer = None  # [ReNeuS] trimesh CPU ray tracer（fallback）
@@ -835,23 +837,42 @@ class NeuSRenderer:
             fresnel_T = 1.0 - fresnel_R
 
             # Reflection branch
-            reflect_o = h_pts + 1e-4 * d_reflect
-            reflect_ior = ior1
+            if self.enable_reflection:
+                # [ReNeuS 原始行為] 同時產生反射+折射兩組 ray
+                reflect_o   = h_pts + 1e-4 * d_reflect
+                reflect_ior = ior1
 
-            # Refraction branch: only non-TIR rays, weight *= T
-            refract_valid = valid_refract
-            refract_o = h_pts[refract_valid] + 1e-4 * d_refract[refract_valid]
-            refract_ior = ior2[refract_valid]
+                # Refraction branch: only non-TIR rays, weight *= T
+                refract_valid = valid_refract
+                refract_o   = h_pts[refract_valid] + 1e-4 * d_refract[refract_valid]
+                refract_ior = ior2[refract_valid]
 
-            # Concatenate both branches
-            next_pixel_idx = torch.cat([h_pixel, h_pixel[refract_valid]])
-            next_o = torch.cat([reflect_o, refract_o])
-            next_d = torch.cat([d_reflect, d_refract[refract_valid]])
-            next_ior = torch.cat([reflect_ior, refract_ior])
-            next_weight = torch.cat([
-                h_weight * fresnel_R.unsqueeze(-1),
-                h_weight[refract_valid] * fresnel_T[refract_valid].unsqueeze(-1)
-            ])
+                # Concatenate both branches
+                next_pixel_idx = torch.cat([h_pixel, h_pixel[refract_valid]])
+                next_o         = torch.cat([reflect_o, refract_o])
+                next_d         = torch.cat([d_reflect, d_refract[refract_valid]])
+                next_ior       = torch.cat([reflect_ior, refract_ior])
+                next_weight    = torch.cat([
+                    h_weight * fresnel_R.unsqueeze(-1),
+                    h_weight[refract_valid] * fresnel_T[refract_valid].unsqueeze(-1)
+                ])
+            else:
+                # [ReNeuS 無反射模式] 全部 throughput 給折射，跳過反射射線
+                # TIR 射線因為無法折射，把它們的 throughput 給背景
+                if tir_mask.any() and background_rgb is not None:
+                    tir_pix = h_pixel[tir_mask]
+                    tir_bg  = h_weight[tir_mask] * background_rgb
+                    final_color.scatter_add_(
+                        0, tir_pix.unsqueeze(-1).expand(-1, 3), tir_bg
+                    )
+
+                refract_valid  = valid_refract
+                next_pixel_idx = h_pixel[refract_valid]
+                next_o         = h_pts[refract_valid] + 1e-4 * d_refract[refract_valid]
+                next_d         = d_refract[refract_valid]
+                next_ior       = ior2[refract_valid]
+                # T=1.0：將反射的 throughput 也全部移給折射，不減行
+                next_weight    = h_weight[refract_valid]
 
             # Update active ray state for next iteration
             pixel_idx = next_pixel_idx

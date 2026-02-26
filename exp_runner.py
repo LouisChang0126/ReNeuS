@@ -81,6 +81,7 @@ class Runner:
         container_mesh_path = getattr(self.dataset, 'container_mesh_path', None)
         ior = getattr(self.dataset, 'ior', 1.5)
         max_bounces = self.conf.get_int('model.reneus.max_bounces', default=3) if 'model.reneus' in self.conf else 3
+        enable_reflection = self.conf.get_bool('model.reneus.enable_reflection', default=True) if 'model.reneus' in self.conf else True
         
         # Override IOR from config if specified
         if 'model.reneus.ior' in self.conf:
@@ -96,7 +97,8 @@ class Runner:
                                      container_mesh_path=container_mesh_path,  # [ReNeuS] 新增
                                      ior=ior,                                  # [ReNeuS] 新增
                                      max_bounces=max_bounces,                  # [ReNeuS] 新增
-                                     scale_mat=self.dataset.scale_mat)         # [ReNeuS] 新增
+                                     scale_mat=self.dataset.scale_mat,         # [ReNeuS] 新增
+                                     enable_reflection=enable_reflection)       # [ReNeuS] 新增
 
 
         # Load checkpoint
@@ -312,8 +314,11 @@ class Runner:
         img_fine = None
         img_internal = None
         if len(out_rgb_fine) > 0:
+            # RGB→BGR: renderer 輸出 RGB，但 cv.imwrite 需要 BGR
             img_fine = (np.concatenate(out_rgb_fine, axis=0).reshape([H, W, 3, -1]) * 256).clip(0, 255)
+            img_fine = img_fine[:, :, ::-1, :]  # RGB → BGR
             img_internal = (np.concatenate(out_rgb_internal, axis=0).reshape([H, W, 3, -1]) * 256).clip(0, 255)
+            img_internal = img_internal[:, :, ::-1, :]  # RGB → BGR
 
         normal_img = None
         if len(out_normal_fine) > 0:
