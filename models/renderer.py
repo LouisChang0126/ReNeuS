@@ -719,7 +719,7 @@ class NeuSRenderer:
                 )
 
                 inner_color_fine[valid_inner] = torch.clamp(ret_in['color'], 0.0, 1.0)
-                # inner_color_fine = torch.pow(inner_color_fine + 1e-8, 1.0 / 2.2) # gamma correction
+                inner_color_fine = torch.pow(inner_color_fine + 1e-8, 1.0 / 2.2) # gamma correction
 
         # =====================================================================
         # Output accumulators (fixed size, indexed by original pixel)
