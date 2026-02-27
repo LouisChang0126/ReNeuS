@@ -667,7 +667,7 @@ class NeuSRenderer:
                     total_dist = exit_dist[both_hit].unsqueeze(-1)  # 容器內部的光路長度
                     # [ReNeuS] 往內縮 margin，跳過容器表面附近的 SDF phantom
                     # SDF 在 entry/exit 附近可能學到假表面（因為訓練時 render_core 也在那邊採樣）
-                    margin = total_dist * 0.1  # 容器內部距離的 5%
+                    margin = total_dist * 0.1  # 容器內部距離的 10%
                     inner_near[valid_indices] = entry_dist[both_hit].unsqueeze(-1) + margin
                     inner_far[valid_indices]  = entry_dist[both_hit].unsqueeze(-1) + total_dist - margin
                     valid_inner[valid_indices] = True
