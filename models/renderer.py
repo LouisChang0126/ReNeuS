@@ -655,20 +655,21 @@ class NeuSRenderer:
                     # 從 entry 點稍微偏移進入容器內部，再射一次找 exit
                     nudged_o = entry_pts + 1e-4 * entry_dirs
                     if self.gpu_intersector is not None:
-                        exit_mask, _, _, exit_dist = \
-                            self.gpu_intersector.intersect_batch(nudged_o, entry_dirs)
+                        exit_mask, _, _, exit_dist = self.gpu_intersector.intersect_batch(nudged_o, entry_dirs)
                     else:
-                        exit_mask, _, _, exit_dist = ray_mesh_intersection(
-                            nudged_o, entry_dirs, self.ray_tracer
-                        )
+                        exit_mask, _, _, exit_dist = ray_mesh_intersection(nudged_o, entry_dirs, self.ray_tracer)
 
                     # 有找到 exit 的光線：near = entry_dist, far = entry_dist + exit_dist
                     hit_indices = torch.where(hit_mask_in)[0]
                     both_hit = exit_mask  # 同時有 entry 和 exit 的光線
                     valid_indices = hit_indices[both_hit]
 
-                    inner_near[valid_indices] = entry_dist[both_hit].unsqueeze(-1) + 1e-4
-                    inner_far[valid_indices]  = entry_dist[both_hit].unsqueeze(-1) + exit_dist[both_hit].unsqueeze(-1)
+                    total_dist = exit_dist[both_hit].unsqueeze(-1)  # 容器內部的光路長度
+                    # [ReNeuS] 往內縮 margin，跳過容器表面附近的 SDF phantom
+                    # SDF 在 entry/exit 附近可能學到假表面（因為訓練時 render_core 也在那邊採樣）
+                    margin = total_dist * 0.1  # 容器內部距離的 5%
+                    inner_near[valid_indices] = entry_dist[both_hit].unsqueeze(-1) + margin
+                    inner_far[valid_indices]  = entry_dist[both_hit].unsqueeze(-1) + total_dist - margin
                     valid_inner[valid_indices] = True
             else:
                 # 沒有容器 mesh，fallback 到 near/far
